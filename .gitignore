@@ -1,0 +1,40 @@
+# Local test infrastructure — fetches copyrighted .uhs samples on demand
+# and caches Java reference outputs. See testing/README.md for why this
+# directory is excluded from version control rather than committed.
+testing/samples/
+testing/expected/
+testing/actual/
+testing/.openuhs/
+testing/.catalog/
+testing/.regression.conf
+testing/.test.log
+
+# Local tool scratch directories
+.claude/
+.claude/**
+
+# Editor / OS noise
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+.*.swp
+.*.swo
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.env
+
+# Local config / catalog if cloned next to the script for testing
+my-uhs.conf
+.my-uhs.conf

@@ -1,0 +1,2038 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+my-uhs — colorized command-line reader and local catalog manager for
+Universal Hint System (.uhs) files.
+
+The hint-file parser is a pure-Python port of David Millis' OpenUHS
+(Java, GPLv2+, 2012) — https://github.com/Vhati/OpenUHS — covering both
+88a and 91a/9x formats. No Java required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import logging
+import os
+import re
+import sys
+import time
+import urllib.request
+import urllib.error
+import zipfile
+from dataclasses import dataclass, field
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+__version__ = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Config — search paths, defaults, load, write-default
+# ---------------------------------------------------------------------------
+
+CONFIG_FILENAME = "my-uhs.conf"
+
+# Search order (first hit wins) — also the write-back order for --create-config:
+# the highest-priority writable location is used.
+CONFIG_SEARCH_PATHS = [
+    f"/LINKS/default/{CONFIG_FILENAME}",
+    str(Path.home() / f".{CONFIG_FILENAME}"),
+    f"/etc/{CONFIG_FILENAME}",
+    f"/usr/local/etc/{CONFIG_FILENAME}",
+]
+
+DEFAULTS: Dict[str, str] = {
+    "catalog_dir":   str(Path.home() / ".my-uhs.catalog"),
+    "catalog_url":   "http://www.uhs-hints.com/cgi-bin/update.cgi",
+    "user_agent":    f"my-uhs/{__version__} (+OpenUHS-compatible)",
+    "logfile":       str(Path.home() / "Library" / "Logs" / "my-uhs.log"),
+    "color":         "auto",      # auto | always | never
+    "fetch_timeout": "30",        # seconds
+}
+
+DEFAULT_CONFIG_TEXT = f"""\
+# my-uhs configuration file
+# Edit values below; lines starting with '#' are comments.
+# Search order: /LINKS/default/  →  ~/.{CONFIG_FILENAME}  →  /etc/  →  /usr/local/etc/
+# First hit wins. Override with --config <PATH>.
+
+[my-uhs]
+
+# Local catalog root. Holds:
+#   index.json           — local catalog index
+#   remote-catalog.xml   — last-fetched remote catalog (raw)
+#   files/<name>.uhs     — registered hint files
+catalog_dir = {DEFAULTS['catalog_dir']}
+
+# Remote catalog endpoint (the official OpenUHS update server).
+catalog_url = {DEFAULTS['catalog_url']}
+
+# User-Agent for HTTP requests.
+user_agent = {DEFAULTS['user_agent']}
+
+# Debug log file (only written when -D / --debug is given).
+logfile = {DEFAULTS['logfile']}
+
+# Color mode: auto (TTY-aware), always, or never.
+color = {DEFAULTS['color']}
+
+# Network timeout for pull / catalog refresh, in seconds.
+fetch_timeout = {DEFAULTS['fetch_timeout']}
+"""
+
+
+def find_config(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return explicit if Path(explicit).is_file() else None
+    for p in CONFIG_SEARCH_PATHS:
+        if Path(p).is_file():
+            return p
+    return None
+
+
+def load_config(explicit: Optional[str]
+                ) -> Tuple[Dict[str, str], Optional[str]]:
+    cfg = dict(DEFAULTS)
+    used = find_config(explicit)
+    if used:
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(used, encoding="utf-8")
+        except (OSError, configparser.Error) as e:
+            print(f"my-uhs: warning: cannot read config {used}: {e}",
+                  file=sys.stderr)
+            return cfg, None
+        section = "my-uhs" if parser.has_section("my-uhs") else None
+        items = parser.items(section) if section else parser.defaults().items()
+        for k, v in items:
+            cfg[k.lower()] = os.path.expanduser(os.path.expandvars(v))
+    for k in ("catalog_dir", "logfile"):
+        cfg[k] = os.path.expanduser(os.path.expandvars(cfg[k]))
+    return cfg, used
+
+
+def create_config(target_path: str) -> str:
+    """
+    Write the default config file to `target_path`. Refuses to overwrite an
+    existing file. Returns the path written.
+    """
+    target = Path(target_path)
+    if target.exists():
+        raise FileExistsError(
+            f"refusing to overwrite existing file: {target_path}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(DEFAULT_CONFIG_TEXT, encoding="utf-8")
+    return str(target)
+
+
+def render_effective_config(cfg: Dict[str, str], source: Optional[str]) -> str:
+    """Render the resolved settings as a config-file-style block."""
+    header = (f"# my-uhs effective config (source: {source})\n"
+              if source else
+              "# my-uhs effective config (source: built-in defaults; "
+              "no config file found)\n")
+    body = "[my-uhs]\n" + "".join(
+        f"{k} = {cfg[k]}\n" for k in sorted(cfg))
+    return header + body
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging(debug: bool, logfile: str) -> logging.Logger:
+    log = logging.getLogger("my-uhs")
+    log.setLevel(logging.DEBUG if debug else logging.WARNING)
+    log.propagate = False
+    err = logging.StreamHandler(sys.stderr)
+    err.setLevel(logging.WARNING)
+    err.setFormatter(logging.Formatter("my-uhs: %(levelname)s: %(message)s"))
+    log.addHandler(err)
+    if debug:
+        try:
+            Path(logfile).parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(logfile, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+            log.addHandler(fh)
+            log.debug("--- my-uhs %s starting (pid=%s) ---",
+                      __version__, os.getpid())
+        except OSError as e:
+            print(f"my-uhs: warning: cannot open debug log {logfile}: {e}",
+                  file=sys.stderr)
+    return log
+
+
+# ---------------------------------------------------------------------------
+# Color
+# ---------------------------------------------------------------------------
+
+class C:
+    RESET   = "\033[0m"
+    TITLE   = "\033[1;38;5;213m"   # bold pink
+    SUBJECT = "\033[1;38;5;75m"    # bold blue
+    QUESTION= "\033[38;5;221m"     # yellow
+    HINT    = "\033[38;5;252m"     # off-white
+    CREDIT  = "\033[38;5;108m"     # muted green
+    COMMENT = "\033[38;5;180m"     # tan
+    TEXT    = "\033[38;5;252m"
+    INFO    = "\033[38;5;244m"     # grey
+    LINK    = "\033[38;5;141m"     # purple
+    META    = "\033[2;38;5;245m"   # dim
+    SKIP    = "\033[2;38;5;240m"
+    OK      = "\033[38;5;114m"
+    WARN    = "\033[38;5;208m"
+
+
+def colors_on(mode: str, force_off: bool) -> bool:
+    if force_off or mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if "NO_COLOR" in os.environ:
+        return False
+    return sys.stdout.isatty()
+
+
+class Paint:
+    def __init__(self, enabled: bool):
+        self.on = enabled
+    def __call__(self, text: str, color: str) -> str:
+        return f"{color}{text}{C.RESET}" if self.on else text
+
+
+# ---------------------------------------------------------------------------
+# UHS parser — pure Python port of OpenUHSLib (Vhati/OpenUHS, GPLv2+).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UHSNode:
+    type: str
+    content: str = ""
+    kind: str = "string"           # "string" | "image" | "audio"
+    id: int = -1
+    link_target: int = -1
+    children: List["UHSNode"] = field(default_factory=list)
+
+    @property
+    def is_link(self) -> bool:
+        return self.link_target != -1
+
+
+class UHSParseError(Exception):
+    pass
+
+
+# ---- Decryption (3 variants — see OpenUHSLib) ----
+
+def generate_key(name: str) -> List[int]:
+    k = (ord('k'), ord('e'), ord('y'))
+    out = []
+    for i, ch in enumerate(name):
+        v = ord(ch) + (k[i % 3] ^ (i + 40))
+        while v > 127:
+            v -= 96
+        out.append(v)
+    return out
+
+
+def decrypt_string(s: str) -> str:
+    """For 88a content and standalone 'hint' hunks (no key)."""
+    buf = []
+    for ch in s:
+        c = ord(ch)
+        if c < 32:
+            continue
+        c = c * 2 - 32 if c < 80 else c * 2 - 127
+        buf.append(chr(c))
+    return "".join(buf)
+
+
+def decrypt_nest_string(s: str, key: List[int]) -> str:
+    buf = []
+    klen = len(key)
+    for i, ch in enumerate(s):
+        c = ord(ch) - (key[i % klen] ^ (i + 40))
+        while c < 32:
+            c += 96
+        buf.append(chr(c))
+    return "".join(buf)
+
+
+def decrypt_text_hunk(s: str, key: List[int]) -> str:
+    buf = []
+    klen = len(key)
+    for i, ch in enumerate(s):
+        co = i % klen
+        c = ord(ch) - (key[co] ^ (co + 40))
+        while c < 32:
+            c += 96
+        buf.append(chr(c))
+    return "".join(buf)
+
+
+# ---- Text-escape unfolding ----
+
+_ACCENT = {
+    ":": dict(zip("AEIOUaeiou", "ÄËÏÖÜäëïöü")),
+    "'": dict(zip("AEIOUaeiou", "ÁÉÍÓÚáéíóú")),
+    "`": dict(zip("AEIOUaeiou", "ÀÈÌÒÙàèìòù")),
+    "^": dict(zip("AEIOUaeiou", "ÂÊÎÔÛâêîôû")),
+    "~": {"N": "Ñ", "n": "ñ"},
+}
+
+
+def parse_text_escapes(s: str) -> str:
+    """Port of OpenUHSLib.parseTextEscapes. Hyperlink markers (#h+...#h-)
+    are intentionally preserved verbatim, matching Java's behavior in
+    --print mode."""
+    out = []
+    break_str = " "
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        # ## → literal #
+        if ch == "#" and i + 1 < n and s[i + 1] == "#":
+            out.append("#")
+            i += 2
+            continue
+        if ch == "#":
+            # accents: #a+X<acc>#a- (8 chars)
+            if i + 7 < n and s[i:i + 3] == "#a+" and s[i + 5:i + 8] == "#a-":
+                x, acc = s[i + 3], s[i + 4]
+                m = _ACCENT.get(acc, {}).get(x)
+                if m is not None:
+                    out.append(m); i += 8; continue
+                if x == "a" and acc == "e":
+                    out.append("æ"); i += 8; continue
+                if x == "T" and acc == "M":
+                    out.append("™"); i += 8; continue
+                # fall through — emit '#' literally
+            # whitespace mode toggles
+            if i + 2 < n:
+                tri = s[i:i + 3]
+                if tri in ("#w+", "#w."):
+                    break_str = " "; i += 3; continue
+                if tri == "#w-":
+                    break_str = "\n"; i += 3; continue
+        # ^break^ — sub the current break_str
+        if ch == "^" and s[i:i + 7] == "^break^":
+            out.append(break_str); i += 7; continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# ---- Low-level file reader ----
+
+def _read_uhs_file(path: str, log: logging.Logger
+                   ) -> Tuple[List[str], bytes, int, str, int]:
+    """Returns (body_lines, raw_bytes, raw_offset, name, end_hint_section).
+    body_lines starts after the 4-line header."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data.startswith(b"UHS\r\n"):
+        raise UHSParseError("not a UHS file (missing UHS magic)")
+    sep = data.find(b"\x1a")
+    if sep == -1:
+        text_part = data
+        raw_offset = -1
+        raw_bytes = b""
+    else:
+        text_part = data[:sep]
+        raw_offset = sep + 1
+        raw_bytes = data[raw_offset:]
+    raw_lines = text_part.split(b"\r\n")
+    if raw_lines and raw_lines[-1] == b"":
+        raw_lines.pop()
+    # Latin-1 keeps byte==char for the decryption math, matching the Java
+    # code (which uses RandomAccessFile.readLine()).
+    lines = [b.decode("latin-1") for b in raw_lines]
+    log.debug("read %d lines, raw_offset=%d, raw_bytes=%d",
+              len(lines), raw_offset, len(raw_bytes))
+    if len(lines) < 5 or lines[0] != "UHS":
+        raise UHSParseError("UHS header malformed")
+    name = lines[1]
+    try:
+        end_hint = int(lines[3])
+    except ValueError as e:
+        raise UHSParseError(f"could not parse header line 4: {e}")
+    return lines[4:], raw_bytes, raw_offset, name, end_hint
+
+
+# ---- Top-level dispatch ----
+
+def parse_uhs(path: str, log: logging.Logger) -> Tuple[UHSNode, str]:
+    body, raw, raw_off, name, end_hint = _read_uhs_file(path, log)
+    sentinel = "** END OF 88A FORMAT **"
+    is_88a = True
+    for i, ln in enumerate(body):
+        if ln == sentinel:
+            is_88a = False
+            body = body[i + 1:]
+            log.debug("9x sentinel at body offset %d", i)
+            break
+    if is_88a:
+        log.debug("format: 88a")
+        return _parse_88a(body, name, end_hint, log), "88a"
+    root = _parse_9x(body, raw, raw_off, log)
+    return root, _detect_version(body)
+
+
+def _detect_version(body: List[str]) -> str:
+    for i, ln in enumerate(body):
+        if re.match(r"^\d+ version$", ln) and i + 1 < len(body):
+            return body[i + 1]
+    return "9x"
+
+
+# ---- 88a parser ----
+
+def _parse_88a(body: List[str], name: str, end_hint: int,
+               log: logging.Logger) -> UHSNode:
+    """Port of parse88Format. body starts at the first subject."""
+    root = UHSNode(type="Root", content=name)
+    if len(body) < 2:
+        raise UHSParseError("88a: body too short")
+    try:
+        q_start = int(body[1]) - 1   # 1-based → 0-based
+    except ValueError as e:
+        raise UHSParseError(f"88a: bad question-section start: {e}")
+
+    # Subjects: pairs at indices 0,2,4,... up to q_start.
+    subj_records: List[Tuple[UHSNode, int]] = []   # (node, first_q)
+    for s in range(0, q_start, 2):
+        subj = UHSNode(type="Subject",
+                       content=parse_text_escapes(decrypt_string(body[s])))
+        root.children.append(subj)
+        subj_records.append((subj, int(body[s + 1]) - 1))
+
+    # For each subject, walk its question pairs until we hit the next subject's
+    # first-question index (or end_hint for the last subject).
+    for idx, (subj, first_q) in enumerate(subj_records):
+        next_q = (subj_records[idx + 1][1] if idx + 1 < len(subj_records)
+                  else end_hint - 1)
+        q = first_q
+        while q < next_q - 1:
+            try:
+                question = parse_text_escapes(decrypt_string(body[q]))
+                hint_first = int(body[q + 1]) - 1
+            except (IndexError, ValueError) as e:
+                log.debug("88a: stopping at q=%d: %s", q, e)
+                break
+            qnode = UHSNode(type="Question", content=question)
+            subj.children.append(qnode)
+            # Hints run from hint_first up to the next question's first hint,
+            # or to end_hint - 1 if this is the last question.
+            if q + 3 < next_q * 2:   # crude; refined below
+                pass
+            # Find next-question start: scan for the next pair-of-(text,#).
+            nq = q + 2
+            if nq < next_q - 1:
+                next_hint = int(body[nq + 1]) - 1 if nq + 1 < len(body) else end_hint - 1
+            else:
+                next_hint = end_hint - 1
+            for h in range(hint_first, next_hint):
+                try:
+                    line = body[h]
+                except IndexError:
+                    break
+                qnode.children.append(UHSNode(
+                    type="Hint",
+                    content=parse_text_escapes(decrypt_string(line))))
+            q = nq
+    return root
+
+
+# ---- 9x parser ----
+
+_NODE_HEAD = re.compile(r"^(\d+) ([A-Za-z]+)$")
+
+
+def _parse_9x(body: List[str], raw: bytes, raw_off: int,
+              log: logging.Logger) -> UHSNode:
+    """Port of parse9xFormat. body starts after the END OF 88A FORMAT line.
+    body[1] (1-based) is the first node header — we use 1-based indexing
+    throughout to match the Java code's getLoggedString offsets."""
+    if len(body) < 2:
+        raise UHSParseError("9x: body too short")
+    # In Java: name = getLoggedString(uhsFileArray, 2); index = 1; ... +=
+    # buildNodes(..., index=1). The "name" line is body[1] (1-based) which
+    # is body[0] in Python — but the dispatcher starts at line 1 (1-based)
+    # which is the FIRST count/header line for the root subject.
+    # We keep 1-based indexing internally to mirror the source closely.
+
+    # Find the master subject title for key generation: it's the line after
+    # the first "<n> subject" header.
+    master_name = ""
+    for i, ln in enumerate(body):
+        m = _NODE_HEAD.match(ln)
+        if m and m.group(2) == "subject" and i + 1 < len(body):
+            master_name = body[i + 1]
+            break
+    key = generate_key(master_name)
+    log.debug("9x master='%s' keylen=%d", master_name, len(key))
+
+    root = UHSNode(type="Root", content="root")
+    idx = 1  # 1-based index
+    idx = _build_nodes(body, raw, raw_off, root, root, key, idx, log)
+
+    # AUX_NEST (Java's default): hoist the master Subject's children up to
+    # root, replace root's content with the master title, then insert a
+    # Blank '--=File Info=--' separator before the remaining auxiliary nodes
+    # (Version, Info, Incentive, ...).
+    if root.children and root.children[0].type == "Subject":
+        master = root.children[0]
+        root.content = master.content
+        root.children = list(master.children)
+        root.children.append(UHSNode(type="Blank", content="--=File Info=--"))
+
+    while idx < len(body) + 1:
+        consumed = _build_nodes(body, raw, raw_off, root, root, key, idx, log)
+        if consumed == idx:
+            break
+        idx = consumed
+    return root
+
+
+def _line(body: List[str], i: int) -> str:
+    """1-based access matching Java's getLoggedString."""
+    if i < 1 or i > len(body):
+        return ""
+    return body[i - 1]
+
+
+def _build_nodes(body, raw, raw_off, root, current, key, start, log) -> int:
+    """Returns the *new* index (start + lines_consumed)."""
+    if start < 1 or start > len(body):
+        return start + 1
+    head = _line(body, start)
+    m = _NODE_HEAD.match(head)
+    if not m:
+        return start + 1
+    count, kind = int(m.group(1)), m.group(2)
+
+    handlers = {
+        "comment":   _parse_comment,
+        "credit":    _parse_credit,
+        "hint":      _parse_hint,
+        "nesthint":  _parse_nesthint,
+        "subject":   _parse_subject,
+        "link":      _parse_link,
+        "text":      _parse_text,
+        "hyperpng":  _parse_skip_image,
+        "gifa":      _parse_skip_image,
+        "sound":     _parse_skip_sound,
+        "blank":     _parse_blank,
+        "version":   _parse_version,
+        "info":      _parse_info,
+        "incentive": _parse_incentive,
+    }
+    h = handlers.get(kind, _parse_unknown)
+    consumed = h(body, raw, raw_off, root, current, key, start, count, log)
+    return start + consumed
+
+
+def _add_child(root: UHSNode, parent: UHSNode, node: UHSNode, start: int):
+    node.id = start
+    parent.children.append(node)
+
+
+# Each parser returns lines_consumed (== count). Most have the shape:
+#   line[start]            "<count> <kind>"
+#   line[start+1]          title
+#   line[start+2 ..]       payload (count - 1 more lines after the header)
+
+def _parse_subject(body, raw, raw_off, root, cur, key, start, count, log):
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Subject", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1   # already-consumed: header + title; "inner" excludes both
+    j = 0
+    base = start + 2
+    while j < inner - 1:
+        nxt = _build_nodes(body, raw, raw_off, root, node, key, base + j, log)
+        step = nxt - (base + j)
+        if step <= 0:
+            break
+        j += step
+    return count
+
+
+def _parse_hint(body, raw, raw_off, root, cur, key, start, count, log):
+    """Port of parseHintNode. Notes on quirks faithfully preserved:
+       (a) hint segments are joined with the literal '^break^' marker — the
+           subsequent parse_text_escapes pass turns it into ' ' (or '\\n'
+           when #w- is in effect);
+       (b) a payload line of exactly ' ' (single space) is appended as
+           '\\n \\n' to force a real blank line in the rendered output."""
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Question", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1 - 1   # header + title already accounted for
+    parts: List[str] = []   # current accumulating segment
+
+    def flush():
+        if not parts:
+            return
+        joined = "^break^".join(parts)
+        node.children.append(UHSNode(
+            type="Hint", content=parse_text_escapes(joined)))
+        parts.clear()
+
+    base = start + 2
+    for j in range(inner):
+        ln = _line(body, base + j)
+        if ln == "-":
+            flush()
+        elif ln == " ":
+            parts.append("\n \n")
+        else:
+            parts.append(decrypt_string(ln))
+    flush()
+    return count
+
+
+def _parse_nesthint(body, raw, raw_off, root, cur, key, start, count, log):
+    """Port of parseNestHintNode. Like _parse_hint, segments are joined
+    with the literal '^break^' marker so parse_text_escapes can substitute
+    ' ' or '\\n' depending on the #w-/#w+ toggle in effect."""
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Question", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1 - 1
+    parts: List[str] = []
+
+    def flush():
+        if not parts:
+            return
+        joined = "^break^".join(parts)
+        node.children.append(UHSNode(
+            type="Hint", content=parse_text_escapes(joined)))
+        parts.clear()
+
+    base = start + 2
+    j = 0
+    while j < inner:
+        ln = _line(body, base + j)
+        if ln == "-":
+            flush()
+            j += 1
+        elif ln == "=":
+            flush()
+            nxt = _build_nodes(body, raw, raw_off, root, node, key,
+                               base + j + 1, log)
+            step = nxt - (base + j + 1)
+            j += 1 + max(step, 1)
+        else:
+            parts.append(decrypt_nest_string(ln, key))
+            j += 1
+    flush()
+    return count
+
+
+def _parse_comment(body, raw, raw_off, root, cur, key, start, count, log):
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Comment", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1
+    text = " ".join(_line(body, start + 2 + j) for j in range(inner - 1))
+    node.children.append(UHSNode(type="CommentData",
+                                 content=parse_text_escapes(text)))
+    return count
+
+
+def _parse_credit(body, raw, raw_off, root, cur, key, start, count, log):
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Credit", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1
+    text = " ".join(_line(body, start + 2 + j) for j in range(inner - 1))
+    node.children.append(UHSNode(type="CreditData",
+                                 content=parse_text_escapes(text)))
+    return count
+
+
+def _parse_text(body, raw, raw_off, root, cur, key, start, count, log):
+    """text node: header, title, then a single 'NNNNNNNNN 0 OFFSET LENGTH' line."""
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Text", content=title)
+    _add_child(root, cur, node, start)
+    spec = _line(body, start + 2)
+    # spec format: 9-digit-id ' 0 ' offset ' ' length
+    parts = spec.split(" ")
+    if len(parts) >= 4 and raw_off != -1:
+        try:
+            offset = int(parts[-2]) - raw_off
+            length = int(parts[-1])
+            chunk = raw[offset:offset + length]
+            decoded = chunk.decode("latin-1")
+            lines = re.split(r"\r\n|\r|\n", decoded)
+            # Java's String.split() with no limit drops trailing empty
+            # strings; Python's re.split keeps them. Strip to match.
+            while lines and lines[-1] == "":
+                lines.pop()
+            text = "\n".join(decrypt_text_hunk(l, key) for l in lines)
+            node.children.append(UHSNode(type="TextData",
+                                         content=parse_text_escapes(text)))
+        except (ValueError, IndexError) as e:
+            log.debug("text node: bad spec line '%s': %s", spec, e)
+    return count
+
+
+def _parse_link(body, raw, raw_off, root, cur, key, start, count, log):
+    title = parse_text_escapes(_line(body, start + 1))
+    node = UHSNode(type="Link", content=title)
+    try:
+        node.link_target = int(_line(body, start + 2))
+    except ValueError:
+        pass
+    # Note: Link nodes intentionally have no id (parseLinkNode in Java does
+    # not call setId), so the printer renders no '^id^: ' prefix.
+    cur.children.append(node)
+    return count
+
+
+def _parse_blank(body, raw, raw_off, root, cur, key, start, count, log):
+    cur.children.append(UHSNode(type="Blank", content="^^^"))
+    return count
+
+
+def _parse_version(body, raw, raw_off, root, cur, key, start, count, log):
+    title = "Version: " + _line(body, start + 1)
+    node = UHSNode(type="Version", content=parse_text_escapes(title))
+    _add_child(root, cur, node, start)
+    inner = count - 1
+    text = " ".join(_line(body, start + 2 + j) for j in range(inner - 1))
+    node.children.append(UHSNode(type="VersionData",
+                                 content=parse_text_escapes(text)))
+    return count
+
+
+def _parse_info(body, raw, raw_off, root, cur, key, start, count, log):
+    """Direct port of parseInfoNode — collects length=/date=/time=/author=/
+    publisher=/copyright=/author-note=/game-note=/notice/> lines into a
+    single InfoData child, in canonical order, separated as Java does."""
+    title = "Info: " + _line(body, start + 1)
+    node = UHSNode(type="Info", content=title)
+    _add_child(root, cur, node, start)
+    inner = count - 1 - 1   # subtract header AND title
+    if inner <= 0:
+        return count
+    bufs = {k: "" for k in (
+        "length", "date", "time", "author", "publisher",
+        "copyright", "author-note", "game-note", "notice", "unknown")}
+    order = ["length", "date", "time", "author", "publisher",
+             "copyright", "author-note", "game-note", "notice", "unknown"]
+    para_breaks = {"copyright", "author-note", "game-note", "notice"}
+    for j in range(inner):
+        ln = _line(body, start + 2 + j)
+        # Whether to soft-join (' ') or hard-join ('\n') with the running buffer.
+        is_para_continuation = (
+            ln.startswith("copyright")
+            or ln.startswith("notice")
+            or ln.startswith("author-note")
+            or ln.startswith("game-note")
+            or ln.startswith(">"))
+        bc = " " if is_para_continuation else "\n"
+        # Pick the destination bucket and trim well-known prefixes.
+        if   ln.startswith("length="):      key_, payload = "length", ln
+        elif ln.startswith("date="):        key_, payload = "date", ln
+        elif ln.startswith("time="):        key_, payload = "time", ln
+        elif ln.startswith("author="):      key_, payload = "author", ln
+        elif ln.startswith("publisher="):   key_, payload = "publisher", ln
+        elif ln.startswith("copyright="):
+            key_, payload = "copyright", ln[len("copyright="):]
+            if not bufs[key_]:
+                bufs[key_] = "copyright="; bc = ""
+        elif ln.startswith("author-note="):
+            key_, payload = "author-note", ln[len("author-note="):]
+            if not bufs[key_]:
+                bufs[key_] = "author-note="; bc = ""
+        elif ln.startswith("game-note="):
+            key_, payload = "game-note", ln[len("game-note="):]
+            if not bufs[key_]:
+                bufs[key_] = "game-note="; bc = ""
+        elif ln.startswith(">"):
+            key_, payload = "notice", ln[1:]
+        else:
+            key_, payload = "unknown", ln
+            log.debug("info: unknown line: %r", ln)
+        if bufs[key_]:
+            bufs[key_] += bc
+        bufs[key_] += payload
+    # Emit in canonical order; insert blank-line separator before
+    # paragraph-style buckets that sit after a previous bucket.
+    out_parts: List[str] = []
+    for i, name in enumerate(order):
+        v = bufs[name]
+        if not v:
+            continue
+        if out_parts:
+            sep = "\n\n" if name in para_breaks else "\n"
+            out_parts.append(sep)
+        out_parts.append(v)
+    if out_parts:
+        node.children.append(UHSNode(type="InfoData", content="".join(out_parts)))
+    return count
+
+
+def _parse_incentive(body, raw, raw_off, root, cur, key, start, count, log):
+    title = "Incentive: " + _line(body, start + 1)
+    node = UHSNode(type="Incentive", content=title)
+    _add_child(root, cur, node, start)
+    if count >= 3:
+        data = decrypt_nest_string(_line(body, start + 2), key)
+        node.children.append(UHSNode(type="IncentiveData", content=data))
+    return count
+
+
+def _parse_skip_image(body, raw, raw_off, root, cur, key, start, count, log):
+    """hyperpng / gifa: emit a HotSpot wrapper (string title, with id) holding
+    an Image child (kind='image'). We don't actually render the image bytes,
+    so child regions are skipped — but the on-disk byte count is consumed
+    so the dispatcher's index stays in sync with the file."""
+    title = parse_text_escapes(_line(body, start + 1))
+    wrap = UHSNode(type="HotSpot", content=title)
+    _add_child(root, cur, wrap, start)
+    wrap.children.append(UHSNode(type="Image", content="^IMAGE^", kind="image"))
+    return count
+
+
+def _parse_skip_sound(body, raw, raw_off, root, cur, key, start, count, log):
+    """sound: emit a Sound wrapper (string title, with id) holding a
+    SoundData child (kind='audio')."""
+    title = parse_text_escapes(_line(body, start + 1))
+    wrap = UHSNode(type="Sound", content=title)
+    _add_child(root, cur, wrap, start)
+    wrap.children.append(UHSNode(type="SoundData", content="^AUDIO^", kind="audio"))
+    return count
+
+
+def _parse_unknown(body, raw, raw_off, root, cur, key, start, count, log):
+    log.debug("unknown node kind at %d: %r", start, _line(body, start))
+    return count
+
+
+# ---------------------------------------------------------------------------
+# UHS encoder — turn a UHSNode tree into a binary 96a .uhs file.
+# Limited to the node types a human-authored hint file actually needs:
+# Subject / Question (as 'hint') / Comment / Credit / Version / Blank.
+# Image / Audio / Text-hunk nodes are not emitted (they require a binary
+# tail and aren't useful for hand-authored content). The parser will read
+# what we write — round-trip is verified in tests.
+# ---------------------------------------------------------------------------
+
+def _enc_string(s: str) -> str:
+    """Inverse of decrypt_string: byte → ((byte+32)/2 if even else (byte+127)/2).
+    Char codes 32..126 (printable ASCII) round-trip cleanly. Non-ASCII
+    Unicode is sanitised to ASCII first."""
+    s = _sanitise(s)
+    out = []
+    for ch in s:
+        c = ord(ch)
+        if c < 32 or c > 126:
+            # Non-printable: drop it (matches what a real UHS file would have).
+            continue
+        # Inverse of: c < 80 → c*2-32, else c*2-127
+        # We want enc such that decrypt(enc) == c.
+        # Try the "low" branch first (output < 80): enc*2-32 == c → enc = (c+32)/2
+        if (c + 32) % 2 == 0 and (c + 32) // 2 < 80:
+            out.append(chr((c + 32) // 2))
+        else:
+            out.append(chr((c + 127) // 2))
+    return "".join(out)
+
+
+def _enc_nest_string(s: str, key: List[int]) -> str:
+    """Inverse of decrypt_nest_string."""
+    out = []
+    klen = len(key)
+    for i, ch in enumerate(s):
+        c = ord(ch)
+        # decrypt does: tmp = ord - (key[i%klen] ^ (i+40)); while tmp<32: tmp+=96
+        # so encode: ord = c + (key[i%klen] ^ (i+40)), then we may need to
+        # subtract 96 once or twice to get back into the printable range.
+        v = c + (key[i % klen] ^ (i + 40))
+        # Pull v down into a byte the parser will lift back to c.
+        while v > 127:
+            v -= 96
+        out.append(chr(v))
+    return "".join(out)
+
+
+def _count_lines(node: UHSNode) -> int:
+    """How many file-lines this node and its descendants will occupy.
+    The header line (e.g. '5 subject') counts as 1; then title; then
+    inner content. This matches the count Java's parsers expect at the
+    head of each hunk."""
+    t = node.type
+    if t == "Subject":
+        # 1 (header) + 1 (title) + sum(child sizes)
+        return 2 + sum(_count_lines(c) for c in node.children)
+    if t == "Question":
+        # header + title + sum(hint-line counts) — each Hint child contributes
+        # its own line(s) plus a separator '-' between consecutive hints.
+        hints = [c for c in node.children if c.type == "Hint"]
+        if not hints:
+            return 2
+        lines = 0
+        for i, h in enumerate(hints):
+            if i > 0:
+                lines += 1   # '-' separator
+            lines += max(1, h.content.count("\n") + 1)
+        return 2 + lines
+    if t == "Comment":
+        # header + title + 1 line per content (joined by ' ' on parse)
+        if node.children and node.children[0].type == "CommentData":
+            return 3   # header, title, single content line
+        return 2
+    if t == "Credit":
+        if node.children and node.children[0].type == "CreditData":
+            return 3
+        return 2
+    if t == "Version":
+        return 3   # header, title (becomes "Version: ..."), content
+    if t == "Blank":
+        return 1   # just the header
+    return 0
+
+
+def _emit(node: UHSNode, key: List[int], out: List[str]):
+    """Append the file-lines for this node and its descendants to `out`.
+    `out` is a list of strings, each becoming one CRLF-terminated line."""
+    t = node.type
+    n_lines = _count_lines(node)
+
+    if t == "Subject":
+        out.append(f"{n_lines} subject")
+        out.append(_sanitise(node.content))
+        for c in node.children:
+            _emit(c, key, out)
+
+    elif t == "Question":
+        # Java's parseHintNode reads "<count> hint", title, then hint segments
+        # separated by '-' lines.
+        out.append(f"{n_lines} hint")
+        out.append(_sanitise(node.content))
+        hints = [c for c in node.children if c.type == "Hint"]
+        for i, h in enumerate(hints):
+            if i > 0:
+                out.append("-")
+            # Hint content may contain literal \n (e.g. ASCII layouts).
+            # Each \n becomes its own line, and they reassemble in the parser
+            # via the ^break^ join, which we can't recreate without running
+            # _enc_string + the escape system. Simpler: emit each line of the
+            # hint encrypted with _enc_string. Multi-line hints will appear
+            # as separate hint segments on parse, which is faithful enough
+            # for human-authored content.
+            for ln in h.content.split("\n"):
+                if ln == "":
+                    out.append(" ")    # bare-space → '\n \n' on parse
+                else:
+                    out.append(_enc_string(ln))
+
+    elif t == "Comment":
+        out.append(f"{n_lines} comment")
+        out.append(_sanitise(node.content))
+        if node.children and node.children[0].type == "CommentData":
+            # Comment content is joined with ' ' on parse, so we emit it as
+            # one line. Multi-paragraph comments lose paragraph breaks here;
+            # use multiple Comment nodes for that.
+            out.append(_sanitise(node.children[0].content.replace("\n", " ")))
+
+    elif t == "Credit":
+        out.append(f"{n_lines} credit")
+        out.append(_sanitise(node.content))
+        if node.children and node.children[0].type == "CreditData":
+            out.append(_sanitise(node.children[0].content.replace("\n", " ")))
+
+    elif t == "Version":
+        out.append(f"{n_lines} version")
+        # Version title gets "Version: " prefix added on parse, so strip it
+        # from our content if present.
+        title = node.content
+        if title.startswith("Version: "):
+            title = title[len("Version: "):]
+        out.append(_sanitise(title))
+        if node.children and node.children[0].type == "VersionData":
+            out.append(_sanitise(node.children[0].content))
+        else:
+            out.append("")
+
+    elif t == "Blank":
+        out.append(f"{n_lines} blank")
+
+
+_ASCII_FALLBACKS = {
+    "\u2014": "--",   # em-dash
+    "\u2013": "-",    # en-dash
+    "\u2018": "'",    # left single quote
+    "\u2019": "'",    # right single quote / apostrophe
+    "\u201c": '"',    # left double quote
+    "\u201d": '"',    # right double quote
+    "\u2026": "...",  # ellipsis
+    "\u00a0": " ",    # non-breaking space
+    "\u2192": "->",   # right arrow
+    "\u2190": "<-",   # left arrow
+    "\u2022": "*",    # bullet
+}
+
+
+def _sanitise(s: str) -> str:
+    """Map common Unicode punctuation to ASCII, drop anything else outside
+    Latin-1. UHS files are 8-bit Latin-1 internally; the parser's text-escape
+    system is the official way to embed accents (see parse_text_escapes)."""
+    out = []
+    for ch in s:
+        if ch in _ASCII_FALLBACKS:
+            out.append(_ASCII_FALLBACKS[ch])
+            continue
+        if ord(ch) < 256:
+            out.append(ch)
+        else:
+            # Drop unrepresentable chars — better than crashing.
+            out.append("?")
+    return "".join(out)
+
+
+def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
+               version_data: str = "") -> bytes:
+    """Build a complete .uhs file from a UHSNode tree.
+
+    The tree is expected to be a Root whose children are the top-level
+    chapter/section Subjects. master_title is the file-level title (used
+    for key derivation and for the master subject node). version_data is
+    the free-form text shown under the Version node when reading the file
+    — defaults to empty for clean output."""
+    master_title = _sanitise(master_title)
+    # Prepare a master Subject that wraps all children — that's what
+    # AUX_NEST will undo on parse, restoring the user's structure.
+    master = UHSNode(type="Subject", content=master_title,
+                     children=list(root.children))
+
+    # Append a Version node at the end as an "aux" sibling (sits outside
+    # the master subject).
+    version_node = UHSNode(type="Version",
+                           content=f"Version: {version_label}",
+                           children=[UHSNode(type="VersionData",
+                                             content=version_data)])
+
+    key = generate_key(master_title)
+    body_lines: List[str] = []
+    _emit(master, key, body_lines)
+    _emit(version_node, key, body_lines)
+
+    # 88a-style filler that 9x readers must skip past.
+    filler = [
+        "If you do not have a UHS 91a (or higher) reader, read these hints!",
+        "1",
+        str(2 + len(body_lines) + 1),  # endHintSection (close enough)
+        "** END OF 88A FORMAT **",
+    ]
+
+    # Header: "UHS\r\n" + master_title + "\r\n" + "1\r\n" + endHintSection + "\r\n"
+    header = ["UHS", master_title, "1", str(len(body_lines) + 100)]
+    all_lines = header + filler + body_lines
+    text = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
+    # No binary tail needed for the node types we emit.
+    return text + b"\x1a"
+
+
+
+# ---------------------------------------------------------------------------
+# Notes & Compose — author your own .uhs files via a simple markdown format.
+# ---------------------------------------------------------------------------
+
+NOTES_TEMPLATE = """\
+# {title}
+
+<!--
+my-uhs notes file. Edit this in your favorite editor, then run
+    my-uhs compose {slug}
+to turn it into a real .uhs file in your local catalog.
+
+FORMAT
+======
+- '# Title' on the first line is the file title (used everywhere).
+- '## Chapter Name' starts a chapter (a Subject in UHS terms).
+- '### Puzzle / Question' starts a question. Phrase it as the player would.
+- Under each question, write hint TIERS as bullets — each bullet is one hint.
+  Order them from gentle nudge → clearer direction → full answer.
+- '> Note: ...' under a chapter creates a Comment node (background info,
+  not a puzzle).
+- '> Credit: ...' creates a Credit block (e.g. attribution, your name).
+- Blank lines and any other markdown are ignored.
+
+Tip: write the LATER hints first while the puzzle is fresh in your mind,
+then go back and write the gentler nudges that don't spoil it.
+-->
+
+## Chapter 1 — Getting Started
+
+> Note: This is the opening section. Mention any general gameplay tips here.
+
+### How do I do the first thing?
+
+- Have you tried looking around carefully?
+- The thing you need is in the chest by the window.
+- Open the chest, take the glass bottle, and use your repair spell on it.
+
+### What about the second puzzle?
+
+- The girl in the clearing wants something.
+- She's trying to build a stick fortress — yours can help.
+- Cast repair on the bottle, then use the shards on her fortress.
+
+## Chapter 2 — Next Section
+
+### Replace this with your own puzzles
+
+- First nudge.
+- Clearer direction.
+- Full solution.
+
+> Credit: Authored by you, {date}.
+"""
+
+
+_HINT_TIER_RE = re.compile(r"^\s*[-*]\s+(.+)$")
+_NOTE_RE      = re.compile(r"^>\s*Note:\s*(.+)$", re.IGNORECASE)
+_CREDIT_RE    = re.compile(r"^>\s*Credit:\s*(.+)$", re.IGNORECASE)
+
+
+def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
+    """Parse a my-uhs notes markdown file into (title, root_node).
+    Returns a Root node whose children are top-level Subjects (chapters)."""
+    lines = text.splitlines()
+    title = "Untitled"
+    root = UHSNode(type="Root", content="")
+    current_chapter: Optional[UHSNode] = None
+    current_question: Optional[UHSNode] = None
+    in_html_comment = False
+
+    for raw in lines:
+        ln = raw.rstrip()
+        # Skip HTML comments (the embedded instructions in the template).
+        if "<!--" in ln:
+            in_html_comment = True
+        if in_html_comment:
+            if "-->" in ln:
+                in_html_comment = False
+            continue
+        if not ln.strip():
+            continue
+
+        if ln.startswith("# ") and title == "Untitled":
+            title = ln[2:].strip()
+            root.content = title
+            continue
+        if ln.startswith("## "):
+            current_chapter = UHSNode(type="Subject", content=ln[3:].strip())
+            root.children.append(current_chapter)
+            current_question = None
+            continue
+        if ln.startswith("### "):
+            if current_chapter is None:
+                # No chapter yet — synthesise one.
+                current_chapter = UHSNode(type="Subject", content="Hints")
+                root.children.append(current_chapter)
+            current_question = UHSNode(type="Question", content=ln[4:].strip())
+            current_chapter.children.append(current_question)
+            continue
+
+        m_note = _NOTE_RE.match(ln)
+        if m_note and current_chapter is not None:
+            comment = UHSNode(type="Comment", content="Note",
+                              children=[UHSNode(type="CommentData",
+                                                content=m_note.group(1))])
+            current_chapter.children.append(comment)
+            current_question = None
+            continue
+
+        m_credit = _CREDIT_RE.match(ln)
+        if m_credit and current_chapter is not None:
+            credit = UHSNode(type="Credit", content="Credit",
+                             children=[UHSNode(type="CreditData",
+                                               content=m_credit.group(1))])
+            current_chapter.children.append(credit)
+            current_question = None
+            continue
+
+        m_hint = _HINT_TIER_RE.match(ln)
+        if m_hint and current_question is not None:
+            current_question.children.append(
+                UHSNode(type="Hint", content=m_hint.group(1).strip()))
+            continue
+        # Anything else is silently ignored — the file can hold the user's
+        # own freeform notes alongside the structured content.
+
+    return title, root
+
+
+def cmd_notes(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load(); cat.ensure_dirs()
+    notes_dir = Path(cfg["catalog_dir"]) / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    slug = args.name.lower().replace(" ", "-").replace(".uhs", "")
+    if not slug:
+        print("my-uhs: notes name cannot be empty", file=sys.stderr)
+        return 1
+    notes_path = notes_dir / f"{slug}.md"
+
+    if not notes_path.exists():
+        title = args.name.replace("-", " ").replace("_", " ").title()
+        from datetime import date
+        notes_path.write_text(
+            NOTES_TEMPLATE.format(title=title, slug=slug, date=date.today().isoformat()),
+            encoding="utf-8")
+        log.debug("created notes template at %s", notes_path)
+        print(paint(f"# new notes file: {notes_path}", C.META))
+    else:
+        print(paint(f"# editing: {notes_path}", C.META))
+
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    rc = os.system(f'{editor} "{notes_path}"')
+    if rc != 0:
+        print(f"my-uhs: editor exited with status {rc}", file=sys.stderr)
+        return 2
+    print(paint(f"# saved. run: my-uhs compose {slug}", C.OK))
+    return 0
+
+
+def cmd_compose(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load(); cat.ensure_dirs()
+    notes_dir = Path(cfg["catalog_dir"]) / "notes"
+    slug = args.name.lower().replace(" ", "-").replace(".uhs", "")
+    notes_path = notes_dir / f"{slug}.md"
+    if not notes_path.is_file():
+        print(f"my-uhs: no notes file: {notes_path}", file=sys.stderr)
+        print("       run `my-uhs notes <name>` first.", file=sys.stderr)
+        return 1
+
+    title, root = parse_notes_markdown(notes_path.read_text(encoding="utf-8"))
+    if not root.children:
+        print("my-uhs: notes file has no chapters (## headings)",
+              file=sys.stderr)
+        return 2
+    log.debug("composed tree: %d chapters", len(root.children))
+
+    # Encode and write into the catalog.
+    name = f"{slug}.uhs"
+    if not args.force and cat.get(name):
+        print(f"my-uhs: already in catalog: {name} (use --force)",
+              file=sys.stderr)
+        return 1
+    data = encode_uhs(root, title, "96a")
+    dst = cat.files / name
+    dst.write_bytes(data)
+
+    # Verify by parsing it back — catches encoder bugs early.
+    try:
+        parsed_root, fmt = parse_uhs(str(dst), log)
+        ver = hint_version(parsed_root) or fmt
+        verified_title = hint_title(parsed_root) or title
+    except UHSParseError as e:
+        print(f"my-uhs: composed file failed to round-trip: {e}",
+              file=sys.stderr)
+        dst.unlink(missing_ok=True)
+        return 2
+
+    cat.add(CatalogEntry(
+        name=name, title=verified_title, version=ver, path=str(dst),
+        size=dst.stat().st_size, source="compose", fetched_at=time.time()))
+    cat.save()
+    print(paint(f"composed {name}  ({ver})  {verified_title}", C.OK))
+    print(paint(f"# read with: my-uhs read {name}", C.META))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Print — colorized rendering matching Java's --print structure.
+# Java emits TAB indentation; we keep that for layout fidelity.
+# ---------------------------------------------------------------------------
+
+NODE_COLORS = {
+    "Root":         C.TITLE,
+    "Subject":      C.SUBJECT,
+    "Question":     C.QUESTION,
+    "Hint":         C.HINT,
+    "Comment":      C.COMMENT,
+    "CommentData":  C.COMMENT,
+    "Credit":       C.CREDIT,
+    "CreditData":   C.CREDIT,
+    "Text":         C.TEXT,
+    "TextData":     C.TEXT,
+    "Info":         C.INFO,
+    "Version":      C.INFO,
+    "VersionData":  C.INFO,
+    "Incentive":    C.INFO,
+    "IncentiveData":C.INFO,
+    "Link":         C.LINK,
+    "Image":        C.SKIP,
+    "Sound":        C.SKIP,
+    "Blank":        C.META,
+}
+
+
+def render(node: UHSNode, paint: Paint, depth: int = 0, out=sys.stdout):
+    indent = "\t" * depth
+    id_str = "" if node.id == -1 else f"^{node.id}^: "
+    link_str = "" if not node.is_link else f" (^Link to {node.link_target}^)"
+    color = NODE_COLORS.get(node.type, C.HINT)
+
+    if node.kind == "image":
+        body = "^IMAGE^"
+    elif node.kind == "audio":
+        body = "^AUDIO^"
+    else:
+        body = node.content
+
+    line_id = paint(id_str, C.META) if id_str else ""
+    line_link = paint(link_str, C.META) if link_str else ""
+    out.write(f"{indent}{line_id}{paint(body, color)}{line_link}\n")
+    for ch in node.children:
+        render(ch, paint, depth + 1, out)
+
+
+def hint_title(root: UHSNode) -> Optional[str]:
+    """Mirror getHintTitle: root content, or first child if it's 'root'."""
+    if root.content == "root":
+        if root.children and root.children[0].type == "Subject":
+            return root.children[0].content or None
+        return None
+    return root.content or None
+
+
+def hint_version(node: UHSNode) -> Optional[str]:
+    """Reverse-walk to find the last Version node's content (sans 'Version: ')."""
+    found: List[str] = []
+    def walk(n):
+        if n.type == "Version" and n.content:
+            found.append(n.content)
+        for c in n.children:
+            walk(c)
+    walk(node)
+    if not found:
+        return None
+    last = found[-1]
+    return last[len("Version: "):] if last.startswith("Version: ") else last
+
+
+# ---------------------------------------------------------------------------
+# Local catalog
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CatalogEntry:
+    name: str          # canonical key, e.g. "alone.uhs"
+    title: str
+    version: str
+    path: str          # absolute path to the .uhs file in the catalog
+    size: int
+    source: str        # "pull" or "push"
+    fetched_at: float  # unix epoch
+    remote_url: str = ""
+
+    def to_dict(self) -> Dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "CatalogEntry":
+        return cls(**{k: d.get(k, "") for k in (
+            "name", "title", "version", "path", "size", "source",
+            "fetched_at", "remote_url")})
+
+
+class Catalog:
+    def __init__(self, root: str, log: logging.Logger):
+        self.root = Path(root)
+        self.files = self.root / "files"
+        self.index_path = self.root / "index.json"
+        self.remote_cache = self.root / "remote-catalog.xml"
+        self.log = log
+        self._entries: Dict[str, CatalogEntry] = {}
+
+    def ensure_dirs(self):
+        self.files.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> None:
+        if not self.index_path.is_file():
+            self._entries = {}
+            return
+        try:
+            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            self.log.warning("index unreadable, starting fresh: %s", e)
+            self._entries = {}
+            return
+        self._entries = {k: CatalogEntry.from_dict(v) for k, v in data.items()}
+
+    def save(self) -> None:
+        self.ensure_dirs()
+        tmp = self.index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(
+            {k: v.to_dict() for k, v in self._entries.items()},
+            indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.index_path)
+
+    def list(self) -> List[CatalogEntry]:
+        return sorted(self._entries.values(), key=lambda e: e.title.lower())
+
+    def get(self, name: str) -> Optional[CatalogEntry]:
+        return self._entries.get(name.lower())
+
+    def add(self, entry: CatalogEntry) -> None:
+        self._entries[entry.name.lower()] = entry
+
+    def remove(self, name: str) -> bool:
+        return self._entries.pop(name.lower(), None) is not None
+
+
+# ---- Remote catalog (uhs-hints.com update.cgi) ----
+
+_FILE_RE = re.compile(
+    r"<FILE>(.*?)</FILE>", re.DOTALL)
+_TAG_RE = lambda tag: re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL)
+
+
+@dataclass
+class RemoteEntry:
+    title: str
+    name: str
+    url: str
+    date: str
+    csize: int
+    fsize: int
+
+
+def fetch_remote_catalog(cfg: Dict[str, str], log: logging.Logger
+                         ) -> List[RemoteEntry]:
+    url = cfg["catalog_url"]
+    timeout = float(cfg["fetch_timeout"])
+    req = urllib.request.Request(url, headers={"User-Agent": cfg["user_agent"]})
+    log.debug("fetching catalog: %s", url)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read().decode("latin-1")
+    cache = Path(cfg["catalog_dir"]) / "remote-catalog.xml"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(body, encoding="latin-1")
+    return _parse_remote_catalog(body)
+
+
+def _parse_remote_catalog(text: str) -> List[RemoteEntry]:
+    out: List[RemoteEntry] = []
+    flat = re.sub(r"[\r\n]", "", text)
+    for chunk in _FILE_RE.findall(flat):
+        def grab(tag: str) -> str:
+            m = _TAG_RE(tag).search(chunk)
+            return m.group(1).strip() if m else ""
+        try:
+            csize = int(grab("FSIZE") or "0")
+            fsize = int(grab("FFULLSIZE") or "0")
+        except ValueError:
+            csize = fsize = 0
+        out.append(RemoteEntry(
+            title=grab("FTITLE"),
+            name=grab("FNAME"),
+            url=grab("FURL"),
+            date=grab("FDATE"),
+            csize=csize,
+            fsize=fsize,
+        ))
+    return out
+
+
+def fetch_and_extract_uhs(remote: RemoteEntry, cfg: Dict[str, str],
+                          dest_dir: Path, log: logging.Logger) -> Path:
+    """Download the .zip, extract its single .uhs, return path."""
+    timeout = float(cfg["fetch_timeout"])
+    req = urllib.request.Request(remote.url,
+                                 headers={"User-Agent": cfg["user_agent"]})
+    log.debug("downloading %s", remote.url)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        zbytes = r.read()
+    with zipfile.ZipFile(BytesIO(zbytes)) as zf:
+        members = [m for m in zf.namelist() if m.lower().endswith(".uhs")]
+        if not members:
+            raise RuntimeError(f"no .uhs in archive at {remote.url}")
+        member = members[0]
+        target = dest_dir / remote.name.lower()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as src, open(target, "wb") as dst:
+            dst.write(src.read())
+    return target
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="my-uhs",
+        description="Colorized command-line reader and local catalog manager "
+                    "for Universal Hint System (.uhs) files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-c", "--config", nargs="?", const="__SHOW__",
+                   default=None, metavar="PATH",
+                   help="without PATH: print current effective config and "
+                        "exit; with PATH: use that config file (skips search)")
+    p.add_argument("--create-config", nargs="?", const="__STDOUT__",
+                   default=None, metavar="PATH",
+                   help="without PATH: print default config to stdout; "
+                        "with PATH: write default config to PATH "
+                        "(refuses to overwrite)")
+    p.add_argument("-D", "--debug", action="store_true",
+                   help="enable debug logging to the configured logfile")
+    p.add_argument("--no-color", action="store_true",
+                   help="disable ANSI color")
+    p.add_argument("--version", action="version",
+                   version=f"my-uhs {__version__}")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("read", help="render a .uhs file (colorized)")
+    sp.add_argument("file", help="path to .uhs file, or a name in the catalog")
+
+    sp = sub.add_parser("use",
+                        help="interactive hint mode — walk chapters and "
+                             "reveal hints one at a time (no spoilers)")
+    sp.add_argument("file", help="path to .uhs file, or a name in the catalog")
+
+    sp = sub.add_parser("title", help="print only the file's title")
+    sp.add_argument("file")
+
+    sp = sub.add_parser("version", help="print only the file's declared version")
+    sp.add_argument("file")
+
+    sp = sub.add_parser("test", help="parse and report success/failure")
+    sp.add_argument("file")
+
+    sp = sub.add_parser("list", help="list local catalog entries")
+    sp.add_argument("--search", metavar="TERM",
+                    help="filter by title or filename substring "
+                         "(case-insensitive)")
+
+    sp = sub.add_parser("catalog",
+                        help="refresh the cached remote catalog index")
+    sp.add_argument("--search", metavar="TERM",
+                    help="filter listing by title substring (case-insensitive)")
+
+    sp = sub.add_parser("pull",
+                        help="download from the remote catalog into the "
+                             "local catalog. NAME may be an exact filename, "
+                             "a title/filename substring, or 'all'.")
+    sp.add_argument("name", help="catalog name, search term, or 'all'")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite an existing local entry")
+    sp.add_argument("--yes", "-y", action="store_true",
+                    help="don't prompt when a search term matches "
+                         "multiple files")
+
+    sp = sub.add_parser("push",
+                        help="register an existing local .uhs file "
+                             "into the local catalog")
+    sp.add_argument("file", help="path to a local .uhs file")
+    sp.add_argument("--name", help="catalog name (defaults to file basename)")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite an existing local entry")
+
+    sp = sub.add_parser("notes",
+                        help="open a markdown notes file for a game in $EDITOR. "
+                             "Creates a template on first run.")
+    sp.add_argument("name", help="game name / slug (e.g. memoria)")
+
+    sp = sub.add_parser("compose",
+                        help="convert a notes markdown file into a real .uhs "
+                             "in the local catalog")
+    sp.add_argument("name", help="game name / slug (must match a notes file)")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite an existing catalog entry")
+
+    return p
+
+
+def _resolve_file(arg: str, cat: Catalog) -> str:
+    """
+    Resolve `arg` to a .uhs path. Accepts:
+      - an existing filesystem path (`./alone.uhs`, `/path/to/x.uhs`),
+      - a catalog name with extension (`alone.uhs`, case-insensitive),
+      - a catalog name without extension (`alone`, `Alone`, case-insensitive).
+    """
+    if Path(arg).is_file():
+        return arg
+    candidates = [arg]
+    if not arg.lower().endswith(".uhs"):
+        candidates.append(arg + ".uhs")
+    for cand in candidates:
+        e = cat.get(cand)
+        if e and Path(e.path).is_file():
+            return e.path
+    raise FileNotFoundError(arg)
+
+
+def cmd_read(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    path = _resolve_file(args.file, cat)
+    root, _ = parse_uhs(path, log)
+    render(root, paint)
+
+
+# ---------------------------------------------------------------------------
+# Interactive `use` — actually USE a hint file: walk the tree, reveal
+# hints one at a time, never spoil more than asked.
+# ---------------------------------------------------------------------------
+
+class UHSInteractive:
+    """Stack-based interactive walker over a parsed UHS tree."""
+
+    # Node types that act as navigable containers in the menu.
+    NAVIGABLE = {"Subject", "Question"}
+
+    def __init__(self, root: "UHSNode", paint: "Paint"):
+        self.root = root
+        self.paint = paint
+        self.stack: List["UHSNode"] = [root]
+        self.id_map: Dict[int, "UHSNode"] = {}
+        self._index_ids(root)
+
+    def _index_ids(self, node: "UHSNode") -> None:
+        if node.id != -1:
+            self.id_map[node.id] = node
+        for c in node.children:
+            self._index_ids(c)
+
+    def _label(self, n: "UHSNode") -> str:
+        if n.type == "Root":
+            return n.content if n.content and n.content != "root" else "(root)"
+        return n.content or n.type
+
+    def _breadcrumb(self) -> str:
+        return " › ".join(self._label(n) for n in self.stack)
+
+    def _navigable_children(self, node: "UHSNode") -> List["UHSNode"]:
+        return [c for c in node.children if c.type in self.NAVIGABLE]
+
+    def _hints(self, node: "UHSNode") -> List["UHSNode"]:
+        return [c for c in node.children if c.type == "Hint"]
+
+    def _follow_link_if_any(self, node: "UHSNode") -> "UHSNode":
+        if node.is_link and node.link_target in self.id_map:
+            return self.id_map[node.link_target]
+        return node
+
+    def _ask(self, prompt: str) -> Optional[str]:
+        try:
+            return input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+    # --- menu (Root / Subject / Question with nav children) ---
+
+    def _show_menu(self, node: "UHSNode") -> bool:
+        kids = self._navigable_children(node)
+        print()
+        print(self.paint(self._breadcrumb(), C.META))
+        print(self.paint(self._label(node), C.TITLE))
+        if not kids:
+            print(self.paint("  (no chapters or questions here)", C.WARN))
+        else:
+            for i, c in enumerate(kids, 1):
+                marker = "?" if c.type == "Question" else "/"
+                color = C.QUESTION if c.type == "Question" else C.SUBJECT
+                label = c.content or "(untitled)"
+                tail = ""
+                if c.is_link:
+                    tail = self.paint(f"  → link {c.link_target}", C.META)
+                print(f"  {i:>3}. {marker} {self.paint(label, color)}{tail}")
+        ans = self._ask(self.paint(
+            "  [number]=open  b=back  c=chapters  q=quit > ", C.HINT))
+        if ans is None or ans in ("q", "quit", "exit"):
+            return False
+        if ans in ("c", "chapters", "home", "/"):
+            self.stack = [self.root]
+            return True
+        if ans in ("b", "back", "u", "up", ".."):
+            if len(self.stack) > 1:
+                self.stack.pop()
+            else:
+                print(self.paint("  already at the top", C.WARN))
+            return True
+        if ans == "":
+            return True
+        if ans.isdigit():
+            i = int(ans) - 1
+            if 0 <= i < len(kids):
+                self.stack.append(self._follow_link_if_any(kids[i]))
+            else:
+                print(self.paint(f"  out of range: {ans}", C.WARN))
+            return True
+        print(self.paint(f"  unknown command: {ans}", C.WARN))
+        return True
+
+    # --- hint reveal (Question with Hint leaves) ---
+
+    def _show_hints(self, q: "UHSNode") -> bool:
+        hints = self._hints(q)
+        nested = self._navigable_children(q)
+        print()
+        print(self.paint(self._breadcrumb(), C.META))
+        print(self.paint("? " + self._label(q), C.QUESTION))
+        if not hints and not nested:
+            print(self.paint("  (no hints here)", C.WARN))
+            ans = self._ask(self.paint(
+                "  b=back  c=chapters  q=quit > ", C.HINT))
+            return self._handle_nav_only(ans)
+
+        revealed = 0
+        total = len(hints)
+        while revealed < total:
+            remaining = total - revealed
+            prompt = self.paint(
+                f"  [enter]=reveal hint {revealed+1}/{total}  "
+                f"a=all ({remaining})  l=last only  "
+                f"b=back  c=chapters  q=quit > ", C.HINT)
+            ans = self._ask(prompt)
+            if ans is None or ans in ("q", "quit", "exit"):
+                return False
+            if ans in ("c", "chapters", "home", "/"):
+                self.stack = [self.root]
+                return True
+            if ans in ("b", "back", "u", "up", ".."):
+                if len(self.stack) > 1:
+                    self.stack.pop()
+                return True
+            if ans == "":
+                self._print_hint(revealed + 1, hints[revealed])
+                revealed += 1
+                continue
+            if ans in ("a", "all"):
+                while revealed < total:
+                    self._print_hint(revealed + 1, hints[revealed])
+                    revealed += 1
+                break
+            if ans in ("l", "last"):
+                self._print_hint(total, hints[-1],
+                                 note=" (jumped to last)")
+                revealed = total
+                break
+            print(self.paint(f"  unknown command: {ans}", C.WARN))
+
+        # Hints exhausted (or none). Offer nested questions if any, else nav.
+        if nested:
+            return self._show_menu(q)
+        print(self.paint(f"— end of hints ({total}/{total}) —", C.META))
+        ans = self._ask(self.paint(
+            "  b=back  c=chapters  q=quit > ", C.HINT))
+        return self._handle_nav_only(ans)
+
+    def _print_hint(self, n: int, hint: "UHSNode", note: str = "") -> None:
+        body = hint.content if hint.kind == "string" else f"^{hint.kind.upper()}^"
+        print(f"  {n}. {self.paint(body, C.HINT)}"
+              f"{self.paint(note, C.META) if note else ''}")
+
+    def _handle_nav_only(self, ans: Optional[str]) -> bool:
+        if ans is None or ans in ("q", "quit", "exit"):
+            return False
+        if ans in ("c", "chapters", "home", "/"):
+            self.stack = [self.root]
+        elif ans in ("b", "back", "u", "up", "..", ""):
+            if len(self.stack) > 1:
+                self.stack.pop()
+        else:
+            print(self.paint(f"  unknown command: {ans}", C.WARN))
+        return True
+
+    # --- main loop ---
+
+    def run(self) -> None:
+        title = self._label(self.root)
+        print(self.paint(f"=== {title} ===", C.TITLE))
+        print(self.paint(
+            "Interactive hint mode. Reveal hints one at a time.",
+            C.INFO))
+        while self.stack:
+            cur = self.stack[-1]
+            if cur.type == "Question":
+                ok = self._show_hints(cur)
+            else:
+                ok = self._show_menu(cur)
+            if not ok:
+                break
+        print(self.paint("bye.", C.META))
+
+
+def cmd_use(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    path = _resolve_file(args.file, cat)
+    root, _ = parse_uhs(path, log)
+    UHSInteractive(root, paint).run()
+
+
+def cmd_title(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    path = _resolve_file(args.file, cat)
+    root, _ = parse_uhs(path, log)
+    t = hint_title(root)
+    print(f"Title: {t}" if t else "Title: (none)")
+
+
+def cmd_version(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    path = _resolve_file(args.file, cat)
+    root, fmt = parse_uhs(path, log)
+    v = hint_version(root) or fmt
+    print(f"Version: {v}")
+
+
+def cmd_test(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    path = _resolve_file(args.file, cat)
+    try:
+        parse_uhs(path, log)
+    except (UHSParseError, OSError) as e:
+        print(f"Test: Parsing FAILED ({e})")
+        return 2
+    print("Test: Parsing succeeded")
+    return 0
+
+
+def cmd_list(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    entries = cat.list()
+    if args.search:
+        term = args.search.lower()
+        entries = [e for e in entries
+                   if term in e.title.lower() or term in e.name.lower()]
+    if not entries:
+        if args.search:
+            print(f"(no local catalog entry matches {args.search!r})")
+        else:
+            print("(catalog is empty — try `my-uhs pull alone.uhs` "
+                  "or `my-uhs push <file>`)")
+        return 0
+    name_w = max((len(e.name) for e in entries), default=4)
+    ver_w  = max((len(e.version) for e in entries), default=3)
+    for e in entries:
+        size_kb = f"{e.size/1024:.1f}K"
+        line = (f"{paint(e.name.ljust(name_w), C.LINK)}  "
+                f"{paint(e.version.ljust(ver_w), C.INFO)}  "
+                f"{paint(size_kb.rjust(8), C.META)}  "
+                f"{paint(e.title, C.SUBJECT)}")
+        print(line)
+    return 0
+
+
+def cmd_catalog(args, cfg, log, paint):
+    try:
+        remote = fetch_remote_catalog(cfg, log)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(f"my-uhs: catalog fetch failed: {e}", file=sys.stderr)
+        return 2
+    if args.search:
+        term = args.search.lower()
+        remote = [r for r in remote if term in r.title.lower()]
+    print(f"# {len(remote)} entries")
+    for r in remote:
+        print(f"{paint(r.name.ljust(28), C.LINK)}  "
+              f"{paint(r.date.ljust(10), C.META)}  "
+              f"{paint(f'{r.csize/1024:6.1f}K', C.META)}  "
+              f"{paint(r.title, C.SUBJECT)}")
+    return 0
+
+
+def cmd_pull(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load(); cat.ensure_dirs()
+    try:
+        remote = fetch_remote_catalog(cfg, log)
+    except Exception as e:
+        print(f"my-uhs: catalog fetch failed: {e}", file=sys.stderr)
+        return 2
+
+    targets: List[RemoteEntry] = []
+    if args.name == "all":
+        targets = remote
+    else:
+        # 1) exact filename match wins outright
+        by_name = {r.name.lower(): r for r in remote}
+        exact = by_name.get(args.name.lower())
+        if exact:
+            targets.append(exact)
+        else:
+            # 2) substring search across both filename and title
+            term = args.name.lower()
+            matches = [r for r in remote
+                       if term in r.name.lower() or term in r.title.lower()]
+            if not matches:
+                print(f"my-uhs: nothing in remote catalog matches "
+                      f"{args.name!r}", file=sys.stderr)
+                return 1
+            if len(matches) == 1 or args.yes:
+                targets = matches
+            else:
+                # Disambiguate interactively (or show and bail if non-tty)
+                print(f"# {len(matches)} matches for {args.name!r}:")
+                for i, r in enumerate(matches, 1):
+                    print(f"  [{i}] {paint(r.name.ljust(28), C.LINK)}  "
+                          f"{paint(r.title, C.SUBJECT)}")
+                if not sys.stdin.isatty():
+                    print("(re-run with an exact filename, "
+                          "or pass --yes to pull all matches)",
+                          file=sys.stderr)
+                    return 1
+                try:
+                    pick = input("Pick number (or 'a' for all, "
+                                 "Enter to cancel): ").strip().lower()
+                except EOFError:
+                    return 1
+                if not pick:
+                    return 0
+                if pick == "a":
+                    targets = matches
+                else:
+                    try:
+                        targets = [matches[int(pick) - 1]]
+                    except (ValueError, IndexError):
+                        print("my-uhs: invalid selection", file=sys.stderr)
+                        return 1
+
+    ok = skipped = failed = 0
+    try:
+        for r in targets:
+            if not args.force and cat.get(r.name):
+                print(paint(f"skip  {r.name} (already in catalog; --force to overwrite)",
+                            C.META))
+                skipped += 1
+                continue
+            try:
+                path = fetch_and_extract_uhs(r, cfg, cat.files, log)
+            except Exception as e:
+                print(paint(f"fail  {r.name}: {e}", C.WARN), file=sys.stderr)
+                failed += 1
+                continue
+            try:
+                root, fmt = parse_uhs(str(path), log)
+                ver = hint_version(root) or fmt
+                title = hint_title(root) or r.title
+            except UHSParseError as e:
+                print(paint(f"warn  {r.name}: parse error: {e}", C.WARN),
+                      file=sys.stderr)
+                ver, title = "?", r.title
+            cat.add(CatalogEntry(
+                name=r.name.lower(), title=title, version=ver,
+                path=str(path), size=path.stat().st_size,
+                source="pull", fetched_at=time.time(), remote_url=r.url))
+            print(paint(f"ok    {r.name}  ({ver})  {title}", C.OK))
+            ok += 1
+    finally:
+        # Always persist whatever progress we made, even on Ctrl-C.
+        cat.save()
+    if len(targets) > 1:
+        print(paint(f"# {ok} added, {skipped} skipped, {failed} failed", C.META))
+    return 0 if failed == 0 else 2
+
+
+def cmd_push(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load(); cat.ensure_dirs()
+    src = Path(args.file)
+    if not src.is_file():
+        print(f"my-uhs: not a file: {src}", file=sys.stderr); return 1
+    name = (args.name or src.name).lower()
+    if not name.endswith(".uhs"):
+        name += ".uhs"
+    if not args.force and cat.get(name):
+        print(f"my-uhs: already in catalog: {name} (use --force)",
+              file=sys.stderr)
+        return 1
+    try:
+        root, fmt = parse_uhs(str(src), log)
+    except UHSParseError as e:
+        print(f"my-uhs: invalid UHS file: {e}", file=sys.stderr); return 2
+    ver = hint_version(root) or fmt
+    title = hint_title(root) or src.stem
+    dst = cat.files / name
+    dst.write_bytes(src.read_bytes())
+    cat.add(CatalogEntry(
+        name=name, title=title, version=ver, path=str(dst),
+        size=dst.stat().st_size, source="push", fetched_at=time.time()))
+    cat.save()
+    print(paint(f"added {name}  ({ver})  {title}", C.OK))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = _argparser()
+    args = p.parse_args(argv)
+
+    # --create-config: print to stdout, or write to PATH, then exit.
+    if args.create_config is not None:
+        if args.create_config == "__STDOUT__":
+            sys.stdout.write(DEFAULT_CONFIG_TEXT)
+            return 0
+        try:
+            path = create_config(args.create_config)
+        except Exception as e:
+            print(f"my-uhs: --create-config failed: {e}", file=sys.stderr)
+            return 2
+        print(f"my-uhs: created {path}")
+        return 0
+
+    # --config without PATH: print current effective config and exit.
+    show_config = args.config == "__SHOW__"
+    config_path = None if show_config else args.config
+
+    cfg, used = load_config(config_path)
+    if show_config:
+        sys.stdout.write(render_effective_config(cfg, used))
+        return 0
+    log = setup_logging(args.debug, cfg["logfile"])
+    if used:
+        log.debug("config loaded from %s", used)
+    else:
+        log.debug("no config file found; using built-in defaults")
+
+    paint = Paint(colors_on(cfg["color"], args.no_color))
+
+    if not args.cmd:
+        p.print_help(); return 0
+
+    handlers = {
+        "read":    cmd_read,
+        "use":     cmd_use,
+        "title":   cmd_title,
+        "version": cmd_version,
+        "test":    cmd_test,
+        "list":    cmd_list,
+        "catalog": cmd_catalog,
+        "pull":    cmd_pull,
+        "push":    cmd_push,
+        "notes":   cmd_notes,
+        "compose": cmd_compose,
+    }
+    try:
+        rc = handlers[args.cmd](args, cfg, log, paint)
+        return rc if isinstance(rc, int) else 0
+    except FileNotFoundError as e:
+        print(f"my-uhs: not found: {e}", file=sys.stderr)
+        return 1
+    except UHSParseError as e:
+        print(f"my-uhs: parse error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print(file=sys.stderr); return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
