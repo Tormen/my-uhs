@@ -1596,12 +1596,305 @@ class UHSInteractive:
     # Node types that act as navigable containers in the menu.
     NAVIGABLE = {"Subject", "Question"}
 
-    def __init__(self, root: "UHSNode", paint: "Paint"):
+    # Node types the encoder can faithfully round-trip. Files containing
+    # anything outside this set cannot be safely re-saved after an edit.
+    ENCODER_SAFE = {
+        "Root", "Subject", "Question", "Hint",
+        "Comment", "CommentData", "Credit", "CreditData",
+        "Version", "VersionData", "Blank",
+    }
+
+    def __init__(self, root: "UHSNode", paint: "Paint",
+                 state_path: Optional[str] = None,
+                 state_key: Optional[str] = None,
+                 source_path: Optional[str] = None):
         self.root = root
         self.paint = paint
         self.stack: List["UHSNode"] = [root]
         self.id_map: Dict[int, "UHSNode"] = {}
         self._index_ids(root)
+        self.state_path = state_path
+        self.state_key = state_key
+        self.source_path = source_path
+        self._resumed = self._restore_state()
+
+    # --- persistent location (resume across runs) ---
+
+    def _load_state_blob(self) -> dict:
+        if not self.state_path:
+            return {}
+        try:
+            return json.loads(
+                Path(self.state_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _restore_state(self) -> bool:
+        if not (self.state_path and self.state_key):
+            return False
+        blob = self._load_state_blob()
+        ids = blob.get(self.state_key, {}).get("stack", [])
+        if not ids:
+            return False
+        nodes = [self.root]
+        for nid in ids:
+            n = self.id_map.get(nid)
+            if not n:
+                # Tree changed; bail to root rather than crash.
+                return False
+            nodes.append(n)
+        self.stack = nodes
+        return True
+
+    def save_state(self) -> None:
+        if not (self.state_path and self.state_key):
+            return
+        blob = self._load_state_blob()
+        # Persist only the path below root; root is always implicit.
+        ids = [n.id for n in self.stack[1:] if n.id != -1]
+        if ids:
+            blob[self.state_key] = {"stack": ids}
+        else:
+            blob.pop(self.state_key, None)
+        try:
+            p = Path(self.state_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(blob, indent=2, sort_keys=True),
+                           encoding="utf-8")
+            tmp.replace(p)
+        except OSError as e:
+            print(self.paint(
+                f"  warning: could not save resume state: {e}", C.WARN))
+
+    def clear_state(self) -> None:
+        if not (self.state_path and self.state_key):
+            return
+        blob = self._load_state_blob()
+        if blob.pop(self.state_key, None) is not None:
+            try:
+                Path(self.state_path).write_text(
+                    json.dumps(blob, indent=2, sort_keys=True),
+                    encoding="utf-8")
+            except OSError:
+                pass
+
+    # --- non-recursive in-place edit ---
+
+    def _unsupported_types(self) -> List[str]:
+        """Return sorted unique node types in the tree that the encoder
+        cannot round-trip. Empty list = safe to re-save."""
+        seen: set = set()
+        def walk(n: "UHSNode") -> None:
+            seen.add(n.type)
+            for c in n.children:
+                walk(c)
+        walk(self.root)
+        return sorted(seen - self.ENCODER_SAFE)
+
+    def _editable_markdown(self, node: "UHSNode") -> str:
+        """Render the THIS-LEVEL view of `node` for editing. Children's own
+        sub-trees are NOT included — only their titles (for menus) or the
+        Hint leaves directly under a Question."""
+        title = self._label(node)
+        if node.type == "Question":
+            hints = self._hints(node)
+            lines = [
+                "# " + title,
+                "",
+                "# (Edit this question's title above and its hints below.",
+                "#  Each '## Hint N' starts a new hint; text under it is",
+                "#  the hint body. Add / remove '## Hint N' sections freely.",
+                "#  Comment lines start with '#' and are ignored.)",
+                "",
+            ]
+            if not hints:
+                lines += ["## Hint 1", ""]
+            else:
+                for i, h in enumerate(hints, 1):
+                    lines.append(f"## Hint {i}")
+                    lines.append(h.content if h.kind == "string"
+                                 else f"<{h.kind}>")
+                    lines.append("")
+            return "\n".join(lines).rstrip() + "\n"
+
+        # Container (Root / Subject): title + ordered list of child titles.
+        kids = self._navigable_children(node)
+        lines = [
+            "# " + title,
+            "",
+            "# (Edit this section's title above and the child titles below.",
+            "#  ONE bullet per child. Reordering renames in place;",
+            "#  the number of bullets must match the current child count.",
+            "#  Comment lines start with '#' and are ignored.)",
+            "",
+        ]
+        if not kids:
+            lines.append("# (no children)")
+        else:
+            for c in kids:
+                lines.append(f"- {c.content or '(untitled)'}")
+        return "\n".join(lines) + "\n"
+
+    def _parse_edited_markdown(
+            self, text: str, node: "UHSNode"
+    ) -> Tuple[Optional[str], Optional[List[str]], Optional[List[str]]]:
+        """Parse the edited buffer. Returns (new_title, new_child_titles,
+        new_hint_bodies). For containers only new_child_titles is set; for
+        Questions only new_hint_bodies. Raises ValueError on a structural
+        mismatch."""
+        raw_lines = text.splitlines()
+        # Title: first '# ' line that is NOT a '## ' subsection header.
+        new_title: Optional[str] = None
+        for ln in raw_lines:
+            s = ln.strip()
+            if s.startswith("# ") and not s.startswith("## "):
+                new_title = s[2:].strip()
+                break
+            if s == "#":
+                new_title = ""
+                break
+        if new_title is None:
+            raise ValueError("missing title line ('# Title')")
+
+        if node.type == "Question":
+            # Split into '## Hint N' sections.
+            hints: List[List[str]] = []
+            current: Optional[List[str]] = None
+            for ln in raw_lines:
+                s = ln.rstrip("\n")
+                if s.lstrip().startswith("## "):
+                    current = []
+                    hints.append(current)
+                    continue
+                if current is None:
+                    continue
+                # Skip in-section full-line '#' comments.
+                if s.lstrip().startswith("#") and not s.lstrip().startswith("##"):
+                    continue
+                current.append(s)
+            bodies = []
+            for h in hints:
+                while h and h[0].strip() == "":
+                    h.pop(0)
+                while h and h[-1].strip() == "":
+                    h.pop()
+                bodies.append("\n".join(h))
+            bodies = [b for b in bodies if b != ""]
+            return new_title, None, bodies
+
+        # Container: collect bullet items.
+        bullets: List[str] = []
+        for ln in raw_lines:
+            s = ln.lstrip()
+            if s.startswith("- "):
+                bullets.append(s[2:].rstrip())
+            elif s.startswith("-") and s.rstrip() == "-":
+                bullets.append("")
+        kids = self._navigable_children(node)
+        if len(bullets) != len(kids):
+            raise ValueError(
+                f"child count mismatch: file has {len(kids)} children "
+                f"but you provided {len(bullets)} bullets. "
+                f"Add/remove children outside `use`; this edit is rename-only.")
+        return new_title, bullets, None
+
+    def _apply_edit(self, node: "UHSNode",
+                    new_title: str,
+                    new_child_titles: Optional[List[str]],
+                    new_hint_bodies: Optional[List[str]]) -> None:
+        # Update the node's own title (skip for Root — its content is the
+        # master file title; changing it changes the encryption key, which
+        # we don't want to do casually).
+        if node.type != "Root":
+            node.content = new_title
+        elif new_title and new_title != self._label(node):
+            print(self.paint(
+                "  note: root/file title is the encryption key — "
+                "not changed.", C.WARN))
+
+        if new_child_titles is not None:
+            kids = self._navigable_children(node)
+            for child, t in zip(kids, new_child_titles):
+                child.content = t
+        if new_hint_bodies is not None:
+            # Replace ONLY the Hint children; preserve any other (e.g.
+            # nested Questions) in their original order around them.
+            new_children: List["UHSNode"] = []
+            replaced_hints = False
+            for c in node.children:
+                if c.type == "Hint":
+                    if not replaced_hints:
+                        for body in new_hint_bodies:
+                            new_children.append(
+                                UHSNode(type="Hint", content=body))
+                        replaced_hints = True
+                    # drop original Hint children
+                else:
+                    new_children.append(c)
+            if not replaced_hints:
+                # No prior Hints — append the new ones at the end.
+                for body in new_hint_bodies:
+                    new_children.append(
+                        UHSNode(type="Hint", content=body))
+            node.children = new_children
+
+    def _persist_to_disk(self) -> bool:
+        if not self.source_path:
+            print(self.paint(
+                "  in-memory only: no source path bound.", C.WARN))
+            return False
+        bad = self._unsupported_types()
+        if bad:
+            print(self.paint(
+                f"  cannot re-save .uhs — file contains node types the "
+                f"encoder does not support: {', '.join(bad)}.\n"
+                f"  Edits kept in this session only.", C.WARN))
+            return False
+        try:
+            master = self._label(self.root)
+            data = encode_uhs(self.root, master_title=master)
+            tmp = Path(self.source_path + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(self.source_path)
+        except Exception as e:
+            print(self.paint(
+                f"  failed to write {self.source_path}: {e}", C.WARN))
+            return False
+        print(self.paint(f"  saved → {self.source_path}", C.OK))
+        return True
+
+    def _edit_current(self) -> None:
+        node = self.stack[-1]
+        editor = (os.environ.get("VISUAL")
+                  or os.environ.get("EDITOR")
+                  or "vi")
+        import tempfile
+        suffix = ".question.md" if node.type == "Question" else ".section.md"
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=suffix, delete=False, encoding="utf-8") as tf:
+            tf.write(self._editable_markdown(node))
+            tmp_path = tf.name
+        rc = os.system(f'{editor} "{tmp_path}"')
+        if rc != 0:
+            print(self.paint(
+                f"  editor exited with status {rc}; no changes.", C.WARN))
+            try: os.unlink(tmp_path)
+            except OSError: pass
+            return
+        try:
+            edited = Path(tmp_path).read_text(encoding="utf-8")
+        finally:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+        try:
+            new_title, new_titles, new_bodies = \
+                self._parse_edited_markdown(edited, node)
+        except ValueError as e:
+            print(self.paint(f"  edit rejected: {e}", C.WARN))
+            return
+        self._apply_edit(node, new_title, new_titles, new_bodies)
+        self._persist_to_disk()
 
     def _index_ids(self, node: "UHSNode") -> None:
         if node.id != -1:
@@ -1654,7 +1947,8 @@ class UHSInteractive:
                     tail = self.paint(f"  → link {c.link_target}", C.META)
                 print(f"  {i:>3}. {marker} {self.paint(label, color)}{tail}")
         ans = self._ask(self.paint(
-            "  [number]=open  b=back  c=chapters  q=quit > ", C.HINT))
+            "  [number]=open  e=edit  b=back  c=chapters  q=quit > ",
+            C.HINT))
         if ans is None or ans in ("q", "quit", "exit"):
             return False
         if ans in ("c", "chapters", "home", "/"):
@@ -1665,6 +1959,9 @@ class UHSInteractive:
                 self.stack.pop()
             else:
                 print(self.paint("  already at the top", C.WARN))
+            return True
+        if ans in ("e", "edit"):
+            self._edit_current()
             return True
         if ans == "":
             return True
@@ -1698,7 +1995,7 @@ class UHSInteractive:
             remaining = total - revealed
             prompt = self.paint(
                 f"  [enter]=reveal hint {revealed+1}/{total}  "
-                f"a=all ({remaining})  l=last only  "
+                f"a=all ({remaining})  l=last only  e=edit  "
                 f"b=back  c=chapters  q=quit > ", C.HINT)
             ans = self._ask(prompt)
             if ans is None or ans in ("q", "quit", "exit"):
@@ -1710,6 +2007,13 @@ class UHSInteractive:
                 if len(self.stack) > 1:
                     self.stack.pop()
                 return True
+            if ans in ("e", "edit"):
+                self._edit_current()
+                # Reload hint list since the node may have changed.
+                hints = self._hints(q)
+                total = len(hints)
+                revealed = min(revealed, total)
+                continue
             if ans == "":
                 self._print_hint(revealed + 1, hints[revealed])
                 revealed += 1
@@ -1756,17 +2060,33 @@ class UHSInteractive:
     def run(self) -> None:
         title = self._label(self.root)
         print(self.paint(f"=== {title} ===", C.TITLE))
-        print(self.paint(
-            "Interactive hint mode. Reveal hints one at a time.",
-            C.INFO))
-        while self.stack:
-            cur = self.stack[-1]
-            if cur.type == "Question":
-                ok = self._show_hints(cur)
-            else:
-                ok = self._show_menu(cur)
-            if not ok:
-                break
+        if self._resumed:
+            print(self.paint(
+                f"(resumed at: {self._breadcrumb()} — `c` for chapters)",
+                C.INFO))
+        else:
+            print(self.paint(
+                "Interactive hint mode. Reveal hints one at a time.",
+                C.INFO))
+        try:
+            while self.stack:
+                cur = self.stack[-1]
+                if cur.type == "Question":
+                    ok = self._show_hints(cur)
+                else:
+                    ok = self._show_menu(cur)
+                if not ok:
+                    break
+        finally:
+            self.save_state()
+            if self.state_path and self.state_key:
+                if len(self.stack) > 1:
+                    print(self.paint(
+                        f"saved location → resume with: my-uhs use "
+                        f"{Path(self.state_key).stem}", C.META))
+                else:
+                    print(self.paint(
+                        "no saved location (back at chapters).", C.META))
         print(self.paint("bye.", C.META))
 
 
@@ -1774,7 +2094,12 @@ def cmd_use(args, cfg, log, paint):
     cat = Catalog(cfg["catalog_dir"], log); cat.load()
     path = _resolve_file(args.file, cat)
     root, _ = parse_uhs(path, log)
-    UHSInteractive(root, paint).run()
+    state_path = str(Path(cfg["catalog_dir"]) / "use-state.json")
+    state_key = os.path.realpath(path)
+    UHSInteractive(root, paint,
+                   state_path=state_path,
+                   state_key=state_key,
+                   source_path=path).run()
 
 
 def cmd_title(args, cfg, log, paint):
