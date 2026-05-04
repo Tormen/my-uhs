@@ -1253,6 +1253,151 @@ def cmd_compose(args, cfg, log, paint):
 
 
 # ---------------------------------------------------------------------------
+# Export — turn an existing parsed .uhs into compose-grammar markdown so it
+# can be edited by hand and fed back through `compose --force` to update.
+# ---------------------------------------------------------------------------
+
+def _md_escape_inline(s: str) -> str:
+    """Just make sure the line doesn't accidentally start a markdown
+    construct that the notes parser would mis-recognize."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
+
+def _emit_hint_md(content: str, out: List[str]) -> None:
+    """Emit a Hint as a `- ...` bullet, with multi-line content folded onto
+    indented continuation lines. The notes parser today only reads the first
+    line of a `- ...` bullet — multi-line read-back is part of plan #2."""
+    body = _md_escape_inline(content)
+    parts = body.split("\n")
+    out.append(f"- {parts[0]}")
+    for cont in parts[1:]:
+        out.append(f"  {cont}" if cont else "  ")
+
+
+def serialize_uhs_to_notes_md(root: UHSNode) -> str:
+    """Serialize a parsed UHS tree back into the compose-grammar markdown
+    notes format. Round-trips Subject/Question/Hint/Comment/Credit cleanly;
+    Version/Blank are recreated by the encoder so they're omitted; HotSpot/
+    Sound get a clearly-marked stub (binary content cannot yet be re-embedded
+    on compose — see plan #2)."""
+    title = root.content if root.content and root.content != "root" else "Untitled"
+    out: List[str] = [f"# {title}", ""]
+    out.append("<!--")
+    out.append("Exported from a .uhs by `my-uhs export`.")
+    out.append("Edit, then run: my-uhs compose <name> --force  (to update the .uhs)")
+    out.append("-->")
+    out.append("")
+
+    unsupported: List[str] = []
+
+    def emit_subject(s: UHSNode, depth: int) -> None:
+        # depth 1 == top-level chapter ("## "). Deeper Subjects are flagged
+        # as a known limitation today (plan #2).
+        prefix = "#" * (depth + 1) + " "
+        if depth > 1:
+            out.append(f"<!-- TODO(plan-2): nested Subject at depth {depth} -->")
+        out.append(f"{prefix}{_md_escape_inline(s.content or '(untitled)')}")
+        out.append("")
+        for c in s.children:
+            emit_child(c, depth)
+
+    def emit_question(q: UHSNode) -> None:
+        out.append(f"### {_md_escape_inline(q.content or '(untitled)')}")
+        out.append("")
+        for c in q.children:
+            if c.type == "Hint":
+                _emit_hint_md(c.content, out)
+            elif c.type == "Question":
+                # nested questions — flag (plan #2)
+                out.append(
+                    f"<!-- TODO(plan-2): nested Question "
+                    f"'{(c.content or '')[:40]}' -->")
+            else:
+                # other children inside a question are rare; flag them
+                unsupported.append(c.type)
+                out.append(f"<!-- TODO(plan-2): {c.type} child of Question -->")
+        out.append("")
+
+    def emit_child(c: UHSNode, parent_depth: int) -> None:
+        t = c.type
+        if t == "Subject":
+            emit_subject(c, parent_depth + 1)
+        elif t == "Question":
+            emit_question(c)
+        elif t == "Comment":
+            data = ""
+            if c.children and c.children[0].type == "CommentData":
+                data = c.children[0].content
+            data = _md_escape_inline(data).replace("\n", " ")
+            out.append(f"> Note: {data}")
+            out.append("")
+        elif t == "Credit":
+            data = ""
+            if c.children and c.children[0].type == "CreditData":
+                data = c.children[0].content
+            data = _md_escape_inline(data).replace("\n", " ")
+            out.append(f"> Credit: {data}")
+            out.append("")
+        elif t in ("Version", "Blank"):
+            # Encoder regenerates these — drop on export.
+            pass
+        elif t in ("HotSpot", "Sound", "Image", "SoundData",
+                   "Info", "InfoData", "Incentive", "IncentiveData",
+                   "Text", "TextData", "Link"):
+            unsupported.append(t)
+            label = (c.content or "")[:60]
+            out.append(f"<!-- TODO(plan-2): {t} '{label}' "
+                       f"not yet round-trippable -->")
+            out.append("")
+        else:
+            unsupported.append(t)
+            out.append(f"<!-- TODO(plan-2): unhandled node type '{t}' -->")
+
+    for c in root.children:
+        emit_child(c, parent_depth=0)
+
+    if unsupported:
+        out.append("")
+        out.append("<!--")
+        out.append("EXPORT WARNINGS — these node types are not yet round-trippable")
+        out.append("through `my-uhs compose` (see plan #2):")
+        for t in sorted(set(unsupported)):
+            out.append(f"  - {t} ({unsupported.count(t)}x)")
+        out.append("Re-composing this file as-is will DROP those nodes.")
+        out.append("-->")
+        out.append("")
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def cmd_export(args, cfg, log, paint):
+    cat = Catalog(cfg["catalog_dir"], log); cat.load()
+    src = _resolve_file(args.file, cat)
+    root, _ = parse_uhs(src, log)
+
+    slug = Path(src).stem.lower()
+    if args.dest:
+        dest = Path(args.dest)
+    else:
+        notes_dir = Path(cfg["catalog_dir"]) / "notes"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        dest = notes_dir / f"{slug}.md"
+
+    if dest.exists() and not args.force:
+        print(f"my-uhs: refuse to overwrite {dest} (use --force)",
+              file=sys.stderr)
+        return 2
+
+    md = serialize_uhs_to_notes_md(root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(md, encoding="utf-8")
+    print(paint(f"exported → {dest}", C.OK))
+    print(paint(f"# edit, then: my-uhs compose {slug} --force", C.META))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Print — colorized rendering matching Java's --print structure.
 # Java emits TAB indentation; we keep that for layout fidelity.
 # ---------------------------------------------------------------------------
@@ -1555,6 +1700,16 @@ def _argparser() -> argparse.ArgumentParser:
     sp.add_argument("name", help="game name / slug (must match a notes file)")
     sp.add_argument("--force", action="store_true",
                     help="overwrite an existing catalog entry")
+
+    sp = sub.add_parser("export",
+                        help="dump an existing catalog .uhs into editable "
+                             "compose-grammar markdown")
+    sp.add_argument("file", help="catalog name (with or without .uhs) "
+                                 "or path to a .uhs file")
+    sp.add_argument("dest", nargs="?",
+                    help="output path (default: <catalog_dir>/notes/<slug>.md)")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite an existing destination file")
 
     return p
 
@@ -2345,6 +2500,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "push":    cmd_push,
         "notes":   cmd_notes,
         "compose": cmd_compose,
+        "export":  cmd_export,
     }
     try:
         rc = handlers[args.cmd](args, cfg, log, paint)
