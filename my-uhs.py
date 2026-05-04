@@ -987,6 +987,9 @@ def _count_lines(node: UHSNode) -> int:
         if node.children and node.children[0].type == "IncentiveData":
             return 3
         return 2
+    if t == "Link":
+        # header + title + target id
+        return 3
     if t == "Blank":
         return 1   # just the header
     return 0
@@ -1078,6 +1081,19 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
         if node.children and node.children[0].type == "IncentiveData":
             out.append(_enc_nest_string(
                 _sanitise(node.children[0].content), key))
+
+    elif t == "Link":
+        out.append(f"{n_lines} link")
+        out.append(_sanitise(node.content))
+        # link_target is the integer id of the target node. The id is
+        # the file-line position where the target's header sits; if the
+        # tree structure is preserved end-to-end, the original id is
+        # still valid on round-trip. (For markdown round-trip with
+        # structure changes, see _allocate_link_remap below.)
+        target = node.link_target
+        if -1 != getattr(node, "_remap_target", -1):
+            target = node._remap_target
+        out.append(str(target))
 
     elif t == "Blank":
         out.append(f"{n_lines} blank")
@@ -1951,6 +1967,7 @@ class UHSInteractive:
     ENCODER_SAFE = {
         "Root", "Subject", "Question", "Hint",
         "Comment", "CommentData", "Credit", "CreditData",
+        "Info", "InfoData", "Incentive", "IncentiveData", "Link",
         "Version", "VersionData", "Blank",
     }
 
