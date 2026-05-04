@@ -11,13 +11,90 @@ The hint-file parser is a pure-Python port of David Millis' OpenUHS
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Transparent venv bootstrap — same pattern as my-plex.
+# my-uhs runs from a dedicated user-scope venv at ~/.python.venv/my-uhs.
+# When VENV_DEPS is non-empty and a dep is missing, we (re-)create the venv,
+# `pip install` the deps, and re-exec ourselves inside it. Deps stay empty
+# while the script is pure-stdlib; planned additions (e.g. Pillow for the
+# `use` zone-preview overlay) just land in VENV_DEPS and bootstrap kicks in
+# transparently on next run.
+# ---------------------------------------------------------------------------
+import os
+import subprocess
+import sys
+
+VENV_DIR = os.path.expanduser("~/.python.venv/my-uhs")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
+VENV_DEPS: list = [
+    # "Pillow",   # enable when plan #2 zone-overlay preview lands
+]
+
+
+def _venv_has_deps() -> bool:
+    if not VENV_DEPS:
+        return True
+    if not os.path.isfile(VENV_PYTHON):
+        return False
+    site_root = os.path.join(VENV_DIR, "lib")
+    if not os.path.isdir(site_root):
+        return False
+    found: set = set()
+    for d in os.listdir(site_root):
+        sp = os.path.join(site_root, d, "site-packages")
+        if not os.path.isdir(sp):
+            continue
+        present = {p.lower() for p in os.listdir(sp)}
+        for dep in VENV_DEPS:
+            # Pip-installed package dirs use the canonical lower-case name
+            # (e.g. "PIL" for Pillow, "plexapi" for plexapi). Match on
+            # either the dep name or the well-known import name.
+            wanted = {dep.lower(), _PKG_IMPORT_ALIASES.get(dep, dep).lower()}
+            if present & wanted:
+                found.add(dep)
+    return found == set(VENV_DEPS)
+
+
+_PKG_IMPORT_ALIASES = {
+    "Pillow": "PIL",  # Pillow installs the PIL/ tree
+}
+
+
+def _bootstrap_venv() -> None:
+    print(f"\n >>> Creating python virtualenv {VENV_DIR!r}...\n",
+          file=sys.stderr)
+    rc = subprocess.call([sys.executable, "-m", "venv", VENV_DIR])
+    if rc != 0:
+        print(f"\n  ERROR: failed to create venv at {VENV_DIR}\n",
+              file=sys.stderr)
+        sys.exit(1)
+    if VENV_DEPS:
+        pip = os.path.join(VENV_DIR, "bin", "pip")
+        rc = subprocess.call([pip, "install"] + VENV_DEPS)
+        if rc != 0:
+            print(f"\n  ERROR: failed to install: {', '.join(VENV_DEPS)}\n",
+                  file=sys.stderr)
+            sys.exit(1)
+    print(f"\n >>> DONE creating python virtualenv {VENV_DIR!r}.",
+          file=sys.stderr)
+    print("=" * 64, file=sys.stderr)
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+
+# Skip bootstrap entirely while VENV_DEPS is empty — keeps the
+# pure-stdlib path zero-overhead until a real dep is added.
+if VENV_DEPS and os.path.realpath(sys.executable) != os.path.realpath(
+        VENV_PYTHON):
+    if not _venv_has_deps():
+        _bootstrap_venv()
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+
 import argparse
 import configparser
 import json
 import logging
-import os
 import re
-import sys
 import time
 import urllib.request
 import urllib.error
@@ -1638,6 +1715,9 @@ def _argparser() -> argparse.ArgumentParser:
                    help="enable debug logging to the configured logfile")
     p.add_argument("--no-color", action="store_true",
                    help="disable ANSI color")
+    p.add_argument("--complete", metavar="TOPIC",
+                   help="emit machine-readable completions for TOPIC "
+                        "(files | titles | help-topics) — used by zsh")
     p.add_argument("--version", action="version",
                    version=f"my-uhs {__version__}")
 
@@ -2449,10 +2529,182 @@ def cmd_push(args, cfg, log, paint):
 
 
 # ---------------------------------------------------------------------------
+# Zsh completions — install/update on every run; emit with --complete TOPIC.
+# Same shape as my-plex's pattern.
+# ---------------------------------------------------------------------------
+
+def _emit_completions(topic: str, cfg: Dict[str, str]) -> int:
+    """Emit one item per line for the requested completion topic."""
+    if topic in ("names", "files", "titles"):
+        cat = Catalog(cfg["catalog_dir"], logging.getLogger("my-uhs"))
+        cat.load()
+        for entry in cat.list():
+            if topic == "files":
+                print(entry.name)
+            elif topic == "names":
+                print(Path(entry.name).stem)
+            else:  # titles
+                print(entry.title)
+        return 0
+    print(f"my-uhs: unknown --complete topic: {topic}", file=sys.stderr)
+    return 2
+
+
+_ZSH_COMPLETION_SCRIPT = r'''#compdef my-uhs
+
+_my-uhs() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    local -a global_opts
+    global_opts=(
+        '(-c --config)'{-c,--config}'[print current config / use config file]:config file:_files'
+        '--create-config[print default config / write to PATH]:path:_files'
+        '(-D --debug)'{-D,--debug}'[enable debug logging]'
+        '--no-color[disable ANSI color]'
+        '--complete[machine-readable completions for TOPIC]:topic:(names files titles)'
+        '--version[print version and exit]'
+    )
+
+    local -a subcommands
+    subcommands=(
+        'read:render a .uhs (colorized)'
+        'use:interactive hint mode (no spoilers)'
+        'title:print the file title'
+        'version:print the declared version'
+        'test:parse and report success/failure'
+        'list:list local catalog entries'
+        'catalog:refresh cached remote catalog'
+        'pull:download from remote catalog'
+        'push:register a local .uhs into the catalog'
+        'notes:open markdown notes file in $EDITOR'
+        'compose:turn notes markdown into a .uhs'
+        'export:dump a .uhs to compose-grammar markdown'
+    )
+
+    _arguments -C \
+        $global_opts \
+        '1: :->cmd' \
+        '*::arg:->args'
+
+    case $state in
+        cmd)
+            _describe 'subcommand' subcommands
+            ;;
+        args)
+            case $words[1] in
+                read|use|title|version|test|export)
+                    local -a names
+                    names=( ${(f)"$(my-uhs --complete names 2>/dev/null)"} )
+                    if (( ${#names} > 0 )); then
+                        _describe 'catalog name' names
+                    else
+                        _files -g '*.uhs'
+                    fi
+                    ;;
+                push)
+                    _arguments \
+                        '--name[catalog name override]:name:' \
+                        '--force[overwrite existing entry]' \
+                        '*:.uhs file:_files -g "*.uhs"'
+                    ;;
+                pull)
+                    _arguments \
+                        '--force[overwrite existing local entry]' \
+                        '(-y --yes)'{-y,--yes}'[no prompt on multi-match]' \
+                        '*::name or "all":'
+                    ;;
+                list)
+                    _arguments '--search[filter by substring]:term:'
+                    ;;
+                catalog)
+                    _arguments '--search[filter by substring]:term:'
+                    ;;
+                compose)
+                    local -a names
+                    names=( ${(f)"$(my-uhs --complete names 2>/dev/null)"} )
+                    _arguments \
+                        '--force[overwrite existing entry]' \
+                        "*:slug:($names)"
+                    ;;
+                notes)
+                    local -a names
+                    names=( ${(f)"$(my-uhs --complete names 2>/dev/null)"} )
+                    if (( ${#names} > 0 )); then
+                        _describe 'name / slug' names
+                    fi
+                    ;;
+                export)
+                    _arguments \
+                        '--force[overwrite existing destination]' \
+                        '1:catalog name or .uhs path:_files -g "*.uhs"' \
+                        '2:dest .md path:_files -g "*.md"'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_my-uhs "$@"
+'''
+
+
+def _install_zsh_completions() -> None:
+    """Drop the zsh completion file and (one-time) patch ~/.zshrc to add
+    ~/.zsh/completions to fpath. No-op when the on-disk file already
+    matches the embedded script."""
+    completion_dir = os.path.expanduser("~/.zsh/completions")
+    completion_file = os.path.join(completion_dir, "_my-uhs")
+    try:
+        os.makedirs(completion_dir, exist_ok=True)
+        try:
+            with open(completion_file, "r", encoding="utf-8") as f:
+                if f.read() == _ZSH_COMPLETION_SCRIPT:
+                    return
+        except FileNotFoundError:
+            pass
+        with open(completion_file, "w", encoding="utf-8") as f:
+            f.write(_ZSH_COMPLETION_SCRIPT)
+    except OSError:
+        return  # silently skip — not all environments have a writable HOME
+
+    # Patch ~/.zshrc to put completions on fpath, once.
+    zshrc = os.path.expanduser("~/.zshrc")
+    zshrc_real = os.path.realpath(zshrc) if os.path.islink(zshrc) else zshrc
+    if not os.path.isfile(zshrc_real):
+        return
+    try:
+        with open(zshrc_real, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return
+    if ".zsh/completions" in content:
+        return
+    try:
+        if "oh-my-zsh.sh" in content:
+            patched = re.sub(
+                r"(source.*oh-my-zsh\.sh)",
+                f"# my-uhs zsh completions\n"
+                f"fpath=({completion_dir} $fpath)\n\\1",
+                content, count=1)
+            with open(zshrc_real, "w", encoding="utf-8") as f:
+                f.write(patched)
+        else:
+            with open(zshrc_real, "a", encoding="utf-8") as f:
+                f.write(
+                    f"\n# my-uhs zsh completions\n"
+                    f"fpath=({completion_dir} $fpath)\n"
+                    f"autoload -Uz compinit && compinit\n")
+    except OSError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _install_zsh_completions()
     p = _argparser()
     args = p.parse_args(argv)
 
@@ -2477,6 +2729,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if show_config:
         sys.stdout.write(render_effective_config(cfg, used))
         return 0
+
+    # --complete TOPIC: machine-readable lines for the zsh completion.
+    if args.complete:
+        return _emit_completions(args.complete, cfg)
     log = setup_logging(args.debug, cfg["logfile"])
     if used:
         log.debug("config loaded from %s", used)
