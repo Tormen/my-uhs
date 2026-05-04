@@ -1013,16 +1013,20 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
         for i, h in enumerate(hints):
             if i > 0:
                 out.append("-")
-            # Hint content may contain literal \n (e.g. ASCII layouts).
-            # Each \n becomes its own line, and they reassemble in the parser
-            # via the ^break^ join, which we can't recreate without running
-            # _enc_string + the escape system. Simpler: emit each line of the
-            # hint encrypted with _enc_string. Multi-line hints will appear
-            # as separate hint segments on parse, which is faithful enough
-            # for human-authored content.
-            for ln in h.content.split("\n"):
+            # Hint content may contain literal \n (multi-line hint). The
+            # parser joins our emitted file lines with the literal '^break^'
+            # marker and runs parse_text_escapes; default break_str is ' ',
+            # so without a directive multi-line collapses to spaces. Embed a
+            # leading '#w-' on the first encoded segment to flip the
+            # break_str to '\n' for THIS hint (the directive is local to the
+            # parse_text_escapes call on the joined string of one Hint).
+            ln_parts = h.content.split("\n")
+            is_multiline = len(ln_parts) > 1
+            for j, ln in enumerate(ln_parts):
                 if ln == "":
                     out.append(" ")    # bare-space → '\n \n' on parse
+                elif j == 0 and is_multiline:
+                    out.append(_enc_string("#w-" + ln))
                 else:
                     out.append(_enc_string(ln))
 
@@ -1328,6 +1332,18 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 UHSNode(type="Hint", content=m_hint.group(1).strip()))
             current_blockquote_data = None
             continue
+        # Indented continuation of the most-recent hint: ≥ 2 leading
+        # spaces and the previous structural line was a hint bullet.
+        # Joined onto the hint with a literal newline.
+        if (current_question is not None
+                and current_question.children
+                and current_question.children[-1].type == "Hint"
+                and (raw.startswith("  ") or raw.startswith("\t"))
+                and raw.strip()):
+            tail = raw.lstrip()
+            last = current_question.children[-1]
+            last.content = last.content + "\n" + tail
+            continue
         # Anything else is silently ignored — the file can hold the user's
         # own freeform notes alongside the structured content.
 
@@ -1424,9 +1440,10 @@ def _md_escape_inline(s: str) -> str:
 
 
 def _emit_hint_md(content: str, out: List[str]) -> None:
-    """Emit a Hint as a `- ...` bullet, with multi-line content folded onto
-    indented continuation lines. The notes parser today only reads the first
-    line of a `- ...` bullet — multi-line read-back is part of plan #2."""
+    """Emit a Hint as a `- ...` bullet. Multi-line content folds onto
+    indented (2-space) continuation lines; parse_notes_markdown reads
+    them back into a single Hint node, and the encoder embeds a leading
+    `#w-` directive on multi-line hints so the parser restores newlines."""
     body = _md_escape_inline(content)
     parts = body.split("\n")
     out.append(f"- {parts[0]}")
