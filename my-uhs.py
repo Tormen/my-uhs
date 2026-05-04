@@ -975,6 +975,18 @@ def _count_lines(node: UHSNode) -> int:
         return 2
     if t == "Version":
         return 3   # header, title (becomes "Version: ..."), content
+    if t == "Info":
+        # header + title + N data lines (one per \n-separated line of InfoData)
+        data = ""
+        if node.children and node.children[0].type == "InfoData":
+            data = node.children[0].content
+        n = max(1, data.count("\n") + 1) if data else 0
+        return 2 + n
+    if t == "Incentive":
+        # header + title + 1 nest-encrypted data line
+        if node.children and node.children[0].type == "IncentiveData":
+            return 3
+        return 2
     if t == "Blank":
         return 1   # just the header
     return 0
@@ -1041,6 +1053,27 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
             out.append(_sanitise(node.children[0].content))
         else:
             out.append("")
+
+    elif t == "Info":
+        out.append(f"{n_lines} info")
+        # Parser auto-prefixes "Info: " on the title; strip it on emit.
+        title = node.content
+        if title.startswith("Info: "):
+            title = title[len("Info: "):]
+        out.append(_sanitise(title))
+        if node.children and node.children[0].type == "InfoData":
+            for ln in node.children[0].content.split("\n"):
+                out.append(_sanitise(ln))
+
+    elif t == "Incentive":
+        out.append(f"{n_lines} incentive")
+        title = node.content
+        if title.startswith("Incentive: "):
+            title = title[len("Incentive: "):]
+        out.append(_sanitise(title))
+        if node.children and node.children[0].type == "IncentiveData":
+            out.append(_enc_nest_string(
+                _sanitise(node.children[0].content), key))
 
     elif t == "Blank":
         out.append(f"{n_lines} blank")
