@@ -1214,6 +1214,12 @@ then go back and write the gentler nudges that don't spoil it.
 _HINT_TIER_RE = re.compile(r"^\s*[-*]\s+(.+)$")
 _NOTE_RE      = re.compile(r"^>\s*Note:\s*(.+)$", re.IGNORECASE)
 _CREDIT_RE    = re.compile(r"^>\s*Credit:\s*(.+)$", re.IGNORECASE)
+_INFO_RE      = re.compile(r"^>\s*Info:\s*(.+)$", re.IGNORECASE)
+_INCENTIVE_RE = re.compile(r"^>\s*Incentive:\s*(.+)$", re.IGNORECASE)
+# Continuation of a previous '> ' blockquote — same '>' prefix, no
+# 'Note/Credit/Info/Incentive' keyword, treated as a follow-up line of the
+# most recently opened blockquote-style node.
+_BLOCKQUOTE_CONT_RE = re.compile(r"^>\s?(.*)$")
 
 
 def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
@@ -1224,7 +1230,21 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
     root = UHSNode(type="Root", content="")
     current_chapter: Optional[UHSNode] = None
     current_question: Optional[UHSNode] = None
+    # Last opened blockquote-style data node (Comment/Credit/Info/Incentive)
+    # — receives subsequent unprefixed `> ` continuation lines.
+    current_blockquote_data: Optional[UHSNode] = None
     in_html_comment = False
+
+    def attach_blockquote(parent: UHSNode, type_: str,
+                          data_type: str, content: str) -> UHSNode:
+        wrap = UHSNode(type=type_,
+                       content="Note" if type_ == "Comment"
+                       else ("Credit" if type_ == "Credit"
+                             else (f"{type_}: " + content[:40])))
+        data = UHSNode(type=data_type, content=content)
+        wrap.children.append(data)
+        parent.children.append(wrap)
+        return data
 
     for raw in lines:
         ln = raw.rstrip()
@@ -1236,6 +1256,7 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 in_html_comment = False
             continue
         if not ln.strip():
+            current_blockquote_data = None
             continue
 
         if ln.startswith("# ") and title == "Untitled":
@@ -1246,6 +1267,7 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
             current_chapter = UHSNode(type="Subject", content=ln[3:].strip())
             root.children.append(current_chapter)
             current_question = None
+            current_blockquote_data = None
             continue
         if ln.startswith("### "):
             if current_chapter is None:
@@ -1254,30 +1276,57 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 root.children.append(current_chapter)
             current_question = UHSNode(type="Question", content=ln[4:].strip())
             current_chapter.children.append(current_question)
+            current_blockquote_data = None
             continue
 
         m_note = _NOTE_RE.match(ln)
         if m_note and current_chapter is not None:
-            comment = UHSNode(type="Comment", content="Note",
-                              children=[UHSNode(type="CommentData",
-                                                content=m_note.group(1))])
-            current_chapter.children.append(comment)
+            current_blockquote_data = attach_blockquote(
+                current_chapter, "Comment", "CommentData", m_note.group(1))
             current_question = None
             continue
 
         m_credit = _CREDIT_RE.match(ln)
         if m_credit and current_chapter is not None:
-            credit = UHSNode(type="Credit", content="Credit",
-                             children=[UHSNode(type="CreditData",
-                                               content=m_credit.group(1))])
-            current_chapter.children.append(credit)
+            current_blockquote_data = attach_blockquote(
+                current_chapter, "Credit", "CreditData", m_credit.group(1))
             current_question = None
             continue
+
+        m_info = _INFO_RE.match(ln)
+        if m_info and current_chapter is not None:
+            current_blockquote_data = attach_blockquote(
+                current_chapter, "Info", "InfoData", m_info.group(1))
+            current_question = None
+            continue
+
+        m_incentive = _INCENTIVE_RE.match(ln)
+        if m_incentive and current_chapter is not None:
+            current_blockquote_data = attach_blockquote(
+                current_chapter, "Incentive", "IncentiveData",
+                m_incentive.group(1))
+            current_question = None
+            continue
+
+        # Continuation of a `> ...` blockquote? Append to the last opened
+        # blockquote's data, separated by '\n'. Allowed only when the line
+        # actually starts with '>' AND we just opened a blockquote node.
+        if (current_blockquote_data is not None
+                and ln.lstrip().startswith(">")):
+            m_cont = _BLOCKQUOTE_CONT_RE.match(ln.lstrip())
+            if m_cont:
+                tail = m_cont.group(1)
+                if current_blockquote_data.content:
+                    current_blockquote_data.content += "\n" + tail
+                else:
+                    current_blockquote_data.content = tail
+                continue
 
         m_hint = _HINT_TIER_RE.match(ln)
         if m_hint and current_question is not None:
             current_question.children.append(
                 UHSNode(type="Hint", content=m_hint.group(1).strip()))
+            current_blockquote_data = None
             continue
         # Anything else is silently ignored — the file can hold the user's
         # own freeform notes alongside the structured content.
@@ -1449,11 +1498,27 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
             data = _md_escape_inline(data).replace("\n", " ")
             out.append(f"> Credit: {data}")
             out.append("")
+        elif t == "Info":
+            data = ""
+            if c.children and c.children[0].type == "InfoData":
+                data = c.children[0].content
+            data = _md_escape_inline(data)
+            parts = data.split("\n")
+            out.append(f"> Info: {parts[0]}")
+            for cont in parts[1:]:
+                out.append(f"> {cont}" if cont else ">")
+            out.append("")
+        elif t == "Incentive":
+            data = ""
+            if c.children and c.children[0].type == "IncentiveData":
+                data = c.children[0].content
+            data = _md_escape_inline(data).replace("\n", " ")
+            out.append(f"> Incentive: {data}")
+            out.append("")
         elif t in ("Version", "Blank"):
             # Encoder regenerates these — drop on export.
             pass
         elif t in ("HotSpot", "Sound", "Image", "SoundData",
-                   "Info", "InfoData", "Incentive", "IncentiveData",
                    "Text", "TextData", "Link"):
             unsupported.append(t)
             label = (c.content or "")[:60]
