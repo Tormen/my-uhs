@@ -1131,6 +1131,32 @@ def _sanitise(s: str) -> str:
     return "".join(out)
 
 
+def _allocate_ids(node: UHSNode, idx: int,
+                  remap: Dict[int, int]) -> int:
+    """Walk in encoder DFS order; populate remap[node.id_at_input] = idx
+    so Link.link_target can be patched after the user's edits may have
+    shifted positional ids. Returns the index past this node's footprint."""
+    if node.id != -1:
+        remap[node.id] = idx
+    t = node.type
+    if t == "Subject":
+        # header(1) + title(1) + children
+        sub_idx = idx + 2
+        for c in node.children:
+            sub_idx = _allocate_ids(c, sub_idx, remap)
+        return sub_idx
+    return idx + _count_lines(node)
+
+
+def _patch_link_targets(node: UHSNode, remap: Dict[int, int]) -> None:
+    """Walk tree; for each Link, set node._remap_target = new positional id
+    if the original link_target appears in the remap. _emit picks this up."""
+    if node.type == "Link" and node.link_target in remap:
+        node._remap_target = remap[node.link_target]
+    for c in node.children:
+        _patch_link_targets(c, remap)
+
+
 def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
                version_data: str = "") -> bytes:
     """Build a complete .uhs file from a UHSNode tree.
@@ -1154,6 +1180,13 @@ def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
                                              content=version_data)])
 
     key = generate_key(master_title)
+
+    # Pre-pass: allocate positional ids and patch Link.link_target
+    # so links survive structural edits between export and compose.
+    remap: Dict[int, int] = {}
+    _allocate_ids(master, 1, remap)
+    _patch_link_targets(master, remap)
+
     body_lines: List[str] = []
     _emit(master, key, body_lines)
     _emit(version_node, key, body_lines)
@@ -1240,6 +1273,21 @@ _INCENTIVE_RE = re.compile(r"^>\s*Incentive:\s*(.+)$", re.IGNORECASE)
 # 'Note/Credit/Info/Incentive' keyword, treated as a follow-up line of the
 # most recently opened blockquote-style node.
 _BLOCKQUOTE_CONT_RE = re.compile(r"^>\s?(.*)$")
+# `{#N}` id marker that may follow a Subject/Question heading. Stripped
+# from the visible title and used to set node.id so Link cross-references
+# can resolve via encode_uhs's remap pass.
+_ID_MARKER_RE = re.compile(r"\s*\{#(\d+)\}\s*$")
+# `[Link: title -> #N]` Link reference inside a Subject body.
+_LINK_REF_RE  = re.compile(r"^\[Link:\s*(.+?)\s*->\s*#(\d+)\]\s*$",
+                           re.IGNORECASE)
+
+
+def _strip_id_marker(line: str) -> Tuple[str, int]:
+    """Return (title-without-marker, id_int_or_-1)."""
+    m = _ID_MARKER_RE.search(line)
+    if not m:
+        return line, -1
+    return line[:m.start()].rstrip(), int(m.group(1))
 
 
 def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
@@ -1284,7 +1332,10 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
             root.content = title
             continue
         if ln.startswith("## "):
-            current_chapter = UHSNode(type="Subject", content=ln[3:].strip())
+            title_text, marker_id = _strip_id_marker(ln[3:].strip())
+            current_chapter = UHSNode(type="Subject", content=title_text)
+            if marker_id != -1:
+                current_chapter.id = marker_id
             root.children.append(current_chapter)
             current_question = None
             current_blockquote_data = None
@@ -1294,8 +1345,22 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 # No chapter yet — synthesise one.
                 current_chapter = UHSNode(type="Subject", content="Hints")
                 root.children.append(current_chapter)
-            current_question = UHSNode(type="Question", content=ln[4:].strip())
+            title_text, marker_id = _strip_id_marker(ln[4:].strip())
+            current_question = UHSNode(type="Question", content=title_text)
+            if marker_id != -1:
+                current_question.id = marker_id
             current_chapter.children.append(current_question)
+            current_blockquote_data = None
+            continue
+
+        # [Link: title -> #N] reference, sibling of Questions inside a
+        # Subject. Matches a whole standalone line (no leading bullet etc).
+        m_link = _LINK_REF_RE.match(ln.strip())
+        if m_link and current_chapter is not None:
+            link = UHSNode(type="Link", content=m_link.group(1))
+            link.link_target = int(m_link.group(2))
+            current_chapter.children.append(link)
+            current_question = None
             current_blockquote_data = None
             continue
 
@@ -1483,19 +1548,26 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
 
     unsupported: List[str] = []
 
+    def _id_marker(n: UHSNode) -> str:
+        return f" {{#{n.id}}}" if n.id != -1 else ""
+
     def emit_subject(s: UHSNode, depth: int) -> None:
         # depth 1 == top-level chapter ("## "). Deeper Subjects are flagged
         # as a known limitation today (plan #2).
         prefix = "#" * (depth + 1) + " "
         if depth > 1:
             out.append(f"<!-- TODO(plan-2): nested Subject at depth {depth} -->")
-        out.append(f"{prefix}{_md_escape_inline(s.content or '(untitled)')}")
+        out.append(
+            f"{prefix}{_md_escape_inline(s.content or '(untitled)')}"
+            f"{_id_marker(s)}")
         out.append("")
         for c in s.children:
             emit_child(c, depth)
 
     def emit_question(q: UHSNode) -> None:
-        out.append(f"### {_md_escape_inline(q.content or '(untitled)')}")
+        out.append(
+            f"### {_md_escape_inline(q.content or '(untitled)')}"
+            f"{_id_marker(q)}")
         out.append("")
         for c in q.children:
             if c.type == "Hint":
@@ -1548,11 +1620,16 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
             data = _md_escape_inline(data).replace("\n", " ")
             out.append(f"> Incentive: {data}")
             out.append("")
+        elif t == "Link":
+            label = _md_escape_inline(c.content or "(untitled)")
+            tgt = c.link_target if c.link_target != -1 else 0
+            out.append(f"[Link: {label} -> #{tgt}]")
+            out.append("")
         elif t in ("Version", "Blank"):
             # Encoder regenerates these — drop on export.
             pass
         elif t in ("HotSpot", "Sound", "Image", "SoundData",
-                   "Text", "TextData", "Link"):
+                   "Text", "TextData"):
             unsupported.append(t)
             label = (c.content or "")[:60]
             out.append(f"<!-- TODO(plan-2): {t} '{label}' "

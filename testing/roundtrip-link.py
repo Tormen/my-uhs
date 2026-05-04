@@ -114,7 +114,35 @@ def main() -> int:
         for f in failures:
             print("FAIL:", f)
         return 1
-    print("OK: Link round-trip clean (binary)")
+
+    # ---- Pass 3: markdown round-trip ----
+    md = m.serialize_uhs_to_notes_md(parsed2)
+    title3, root3 = m.parse_notes_markdown(md)
+    blob3 = m.encode_uhs(root3, master_title=title3)
+    fp = tempfile.NamedTemporaryFile(
+        suffix=".uhs", delete=False, dir=str(HERE))
+    fp.write(blob3); fp.close()
+    try:
+        parsed3, _ = m.parse_uhs(fp.name, log)
+    finally:
+        Path(fp.name).unlink(missing_ok=True)
+    links3 = list(find_all(parsed3, "Link"))
+    qs3 = list(find_all(parsed3, "Question"))
+    if len(links3) != 1:
+        failures.append(f"[md] expected 1 Link, got {len(links3)}")
+    elif links3[0].content != "See first question":
+        failures.append(
+            f"[md] Link title: got {links3[0].content!r}")
+    elif links3[0].link_target != qs3[0].id:
+        failures.append(
+            f"[md] Link target: want first Question id {qs3[0].id}, "
+            f"got {links3[0].link_target}")
+
+    if failures:
+        for f in failures:
+            print("FAIL:", f)
+        return 1
+    print("OK: Link round-trip clean (binary + markdown)")
     return 0
 
 
