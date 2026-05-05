@@ -1131,6 +1131,23 @@ def _count_lines(node: UHSNode) -> int:
     if t == "Text":
         # header + title + spec line (offset/length into binary tail)
         return 3
+    if t == "HotSpot":
+        # header + title + main-image spec; zones contribute (4 coords +
+        # inner hunk) per child that has node.zone set. Overlay inner =
+        # 1+1+1 = 3 lines (zone + 'N overlay' + title + spec).
+        # Recursive types use _count_lines via inner hunk.
+        n = 3
+        for c in node.children:
+            if c.zone is None:
+                continue
+            if c.type == "Overlay":
+                n += 4   # zone(1) + '<n> overlay'(1) + title(1) + spec(1)
+            else:
+                n += 1 + _count_lines(c)
+        return n
+    if t == "Sound":
+        # header + title + spec line
+        return 3
     if t == "Blank":
         return 1   # just the header
     return 0
@@ -1243,10 +1260,49 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
         # the offset+length once the binary tail position is known.
         # Format: 9-digit-id, '0', 10-digit offset, 10-digit length.
         out.append("000000000 0 0000000000 0000000000")
-        # Stamp the line index back onto the node so encode_uhs can find
-        # it. Body indexing is via len(out) BEFORE the just-appended
-        # spec line was added; we want the spec line itself.
         node._spec_line_idx = len(out) - 1
+
+    elif t == "HotSpot":
+        # Pick header keyword by main image format. Default to hyperpng.
+        img = next((c for c in node.children if c.type == "Image"), None)
+        kind = "hyperpng"
+        if img is not None and img.binary:
+            ext, _ = _detect_binary_kind(img.binary)
+            if ext == "gif":
+                kind = "gifa"
+        out.append(f"{n_lines} {kind}")
+        out.append(_sanitise(node.content))
+        # Main image spec: '<9-digit-id> <offset> <length>' (3 tokens).
+        out.append("000000000 0000000000 0000000000")
+        if img is not None:
+            img._spec_line_idx = len(out) - 1
+        # Zones — only children with node.zone set are emitted as
+        # zone-bearing siblings inside the HotSpot.
+        for c in node.children:
+            if c.zone is None:
+                continue
+            x1, y1, x2, y2 = c.zone
+            out.append(f"{x1:04d} {y1:04d} {x2:04d} {y2:04d}")
+            if c.type == "Overlay":
+                out.append("4 overlay")
+                out.append(_sanitise(c.content))
+                # Spec: '<id> <offset> <length> <x> <y>' (5 tokens).
+                # Position defaults to (x1, y1) when absent.
+                out.append(
+                    f"000000000 0000000000 0000000000 "
+                    f"{x1:04d} {y1:04d}")
+                c._spec_line_idx = len(out) - 1
+            else:
+                _emit(c, key, out)
+
+    elif t == "Sound":
+        out.append(f"{n_lines} sound")
+        out.append(_sanitise(node.content))
+        out.append("000000000 0000000000 0000000000")
+        sd = next((c for c in node.children
+                   if c.type == "SoundData"), None)
+        if sd is not None:
+            sd._spec_line_idx = len(out) - 1
 
     elif t == "Blank":
         out.append(f"{n_lines} blank")
@@ -1356,31 +1412,50 @@ def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
     header = ["UHS", master_title, "1", str(len(body_lines) + 100)]
     all_lines = header + filler + body_lines
 
-    # Collect Text nodes; if any, the file needs a binary tail. The Text
-    # spec lines emitted above are fixed-width placeholders, so the body
-    # byte size doesn't change when we patch in real offsets/lengths.
-    text_blocks: List[bytes] = []
-    text_specs: List[Tuple[int, int]] = []  # (body_lines index, length)
+    # Collect every binary blob in DFS order. For each, remember the
+    # body-line index of its placeholder spec and the spec FLAVOR
+    # (text → 'id 0 offset length', hyperpng/sound → 'id offset length',
+    # overlay → 'id offset length x y'). All placeholders are fixed
+    # width so the body byte size doesn't change when we patch.
     body_offset_in_all = len(header) + len(filler)
+    bin_blocks: List[bytes] = []
+    # Each spec entry: (body_idx, flavor, length, extra_x_y_or_None)
+    bin_specs: List[Tuple[int, str, int, Optional[Tuple[int, int]]]] = []
 
-    def collect_text(n: UHSNode) -> None:
+    def collect_bin(n: UHSNode) -> None:
+        idx = getattr(n, "_spec_line_idx", -1)
         if n.type == "Text":
-            data = ""
-            if n.children and n.children[0].type == "TextData":
-                data = n.children[0].content
-            data = _sanitise(data)
-            ln_lines = data.split("\n")
-            encoded_lines = [_enc_text_hunk(ln, key) for ln in ln_lines]
-            block = ("\r\n".join(encoded_lines) + "\r\n").encode("latin-1")
-            text_blocks.append(block)
-            spec_idx_in_body = getattr(n, "_spec_line_idx", -1)
-            if spec_idx_in_body >= 0:
-                text_specs.append((spec_idx_in_body, len(block)))
+            if idx < 0:
+                # No spec line — this Text is nested in a hunk type the
+                # encoder doesn't yet recurse into (e.g. a `nesthint`).
+                # Silently skip rather than corrupt offsets by writing
+                # orphan bytes into the binary tail.
+                pass
+            else:
+                data = ""
+                if n.children and n.children[0].type == "TextData":
+                    data = n.children[0].content
+                data = _sanitise(data)
+                ln_lines = data.split("\n")
+                encoded_lines = [_enc_text_hunk(ln, key) for ln in ln_lines]
+                block = ("\r\n".join(encoded_lines) + "\r\n").encode("latin-1")
+                bin_blocks.append(block)
+                bin_specs.append((idx, "text", len(block), None))
+        elif n.type == "Image" and n.binary and idx >= 0:
+            bin_blocks.append(n.binary)
+            bin_specs.append((idx, "hyperpng", len(n.binary), None))
+        elif n.type == "Overlay" and n.binary and idx >= 0:
+            bin_blocks.append(n.binary)
+            xy = (n.zone[0], n.zone[1]) if n.zone else (0, 0)
+            bin_specs.append((idx, "overlay", len(n.binary), xy))
+        elif n.type == "SoundData" and n.binary and idx >= 0:
+            bin_blocks.append(n.binary)
+            bin_specs.append((idx, "sound", len(n.binary), None))
         for c in n.children:
-            collect_text(c)
-    collect_text(master)
+            collect_bin(c)
+    collect_bin(master)
 
-    if not text_blocks:
+    if not bin_blocks:
         text = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
         return text + b"\x1a"
 
@@ -1391,10 +1466,19 @@ def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
     binary_tail_start = len(text_bytes) + 1
 
     cursor = binary_tail_start
-    for body_idx, length in text_specs:
+    for body_idx, flavor, length, extra in bin_specs:
         all_idx = body_offset_in_all + body_idx
-        all_lines[all_idx] = (
-            f"000000000 0 {cursor:010d} {length:010d}")
+        if flavor == "text":
+            all_lines[all_idx] = (
+                f"000000000 0 {cursor:010d} {length:010d}")
+        elif flavor == "overlay":
+            x, y = extra if extra else (0, 0)
+            all_lines[all_idx] = (
+                f"000000000 {cursor:010d} {length:010d} "
+                f"{x:04d} {y:04d}")
+        else:   # hyperpng / sound
+            all_lines[all_idx] = (
+                f"000000000 {cursor:010d} {length:010d}")
         cursor += length
 
     text_bytes_final = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
@@ -1404,7 +1488,7 @@ def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
             f"({len(text_bytes)} → {len(text_bytes_final)}); "
             f"placeholder widths must match real values")
 
-    return text_bytes_final + b"\x1a" + b"".join(text_blocks)
+    return text_bytes_final + b"\x1a" + b"".join(bin_blocks)
 
 
 
@@ -1469,6 +1553,13 @@ _NOTE_RE      = re.compile(r"^>\s*Note:\s*(.+)$", re.IGNORECASE)
 _CREDIT_RE    = re.compile(r"^>\s*Credit:\s*(.+)$", re.IGNORECASE)
 _INFO_RE      = re.compile(r"^>\s*Info:\s*(.+)$", re.IGNORECASE)
 _INCENTIVE_RE = re.compile(r"^>\s*Incentive:\s*(.+)$", re.IGNORECASE)
+_IMAGE_FILE_RE = re.compile(r"^>\s*Image file:\s*(.+?)\s*$",
+                            re.IGNORECASE)
+_SOUND_FILE_RE = re.compile(r"^>\s*Sound file:\s*(.+?)\s*$",
+                            re.IGNORECASE)
+_OVERLAY_RE   = re.compile(
+    r"^>\s*Overlay:\s*(.*?)\s*@\s*\((\d+),(\d+)\)-\((\d+),(\d+)\)"
+    r"\s*[—-]\s*see\s+(\S+)\s*$", re.IGNORECASE)
 # Continuation of a previous '> ' blockquote — same '>' prefix, no
 # 'Note/Credit/Info/Incentive' keyword, treated as a follow-up line of the
 # most recently opened blockquote-style node.
@@ -1490,9 +1581,15 @@ def _strip_id_marker(line: str) -> Tuple[str, int]:
     return line[:m.start()].rstrip(), int(m.group(1))
 
 
-def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
+def parse_notes_markdown(
+        text: str,
+        base_dir: Optional[Path] = None) -> Tuple[str, UHSNode]:
     """Parse a my-uhs notes markdown file into (title, root_node).
-    Returns a Root node whose children are top-level Subjects (chapters)."""
+    Returns a Root node whose children are top-level Subjects (chapters).
+
+    `base_dir` is the directory containing the .md file; sidecar filenames
+    referenced via `> Image file: ...` / `> Sound file: ...` are resolved
+    relative to it. None disables sidecar resolution (binaries dropped)."""
     lines = text.splitlines()
     title = "Untitled"
     root = UHSNode(type="Root", content="")
@@ -1510,6 +1607,11 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
     pending_text_node: Optional[UHSNode] = None
     pending_text_lines: List[str] = []
     in_text_fence = False
+    # `### Image:` and `### Sound:` open a HotSpot/Sound; the next few
+    # `> Image file: ...` / `> Overlay: ...` / `> Sound file: ...`
+    # blockquote lines attach binary content from sidecars.
+    pending_hotspot: Optional[UHSNode] = None
+    pending_sound: Optional[UHSNode] = None
     in_html_comment = False
 
     def attach_blockquote(parent: UHSNode, type_: str,
@@ -1598,6 +1700,44 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 current_question = None
                 current_blockquote_data = None
                 continue
+            # `### Image: Title` → HotSpot node; subsequent
+            # `> Image file: path` lines attach binary content from a
+            # sidecar file. `> Overlay: ... @ (x,y)-(x,y) — see file`
+            # lines attach Overlay children with zone coords.
+            if body_text.lower().startswith("image:"):
+                title_text, marker_id = _strip_id_marker(
+                    body_text[6:].strip())
+                if current_subject is None:
+                    current_chapter = UHSNode(
+                        type="Subject", content="Hints")
+                    root.children.append(current_chapter)
+                    current_subject = current_chapter
+                hs = UHSNode(type="HotSpot", content=title_text)
+                if marker_id != -1:
+                    hs.id = marker_id
+                current_subject.children.append(hs)
+                pending_hotspot = hs
+                current_question = None
+                current_blockquote_data = None
+                continue
+            # `### Sound: Title` → Sound node; subsequent
+            # `> Sound file: path` attaches audio from sidecar.
+            if body_text.lower().startswith("sound:"):
+                title_text, marker_id = _strip_id_marker(
+                    body_text[6:].strip())
+                if current_subject is None:
+                    current_chapter = UHSNode(
+                        type="Subject", content="Hints")
+                    root.children.append(current_chapter)
+                    current_subject = current_chapter
+                sn = UHSNode(type="Sound", content=title_text)
+                if marker_id != -1:
+                    sn.id = marker_id
+                current_subject.children.append(sn)
+                pending_sound = sn
+                current_question = None
+                current_blockquote_data = None
+                continue
             # `### Sub: Title` opens a nested Subject under the current
             # top-level chapter. Subsequent Questions attach to it.
             if body_text.lower().startswith("sub:"):
@@ -1667,6 +1807,63 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
                 current_subject, "Incentive", "IncentiveData",
                 m_incentive.group(1))
             current_question = None
+            continue
+
+        # `> Image file: foo.image.1.png` attaches the sidecar bytes
+        # to the most recently opened HotSpot as its Image child.
+        m_image_file = _IMAGE_FILE_RE.match(ln)
+        if m_image_file and pending_hotspot is not None:
+            fname = m_image_file.group(1).strip()
+            data = b""
+            if base_dir is not None:
+                path = base_dir / fname
+                try:
+                    data = path.read_bytes()
+                except OSError as e:
+                    raise ValueError(
+                        f"compose: missing sidecar {path!r}: {e}") from e
+            img = UHSNode(type="Image", content="^IMAGE^",
+                          kind="image", binary=data or None)
+            pending_hotspot.children.append(img)
+            continue
+
+        # `> Overlay: title @ (x1,y1)-(x2,y2) — see file` attaches an
+        # Overlay child with zone coords.
+        m_overlay = _OVERLAY_RE.match(ln)
+        if m_overlay and pending_hotspot is not None:
+            ov_title = m_overlay.group(1).strip()
+            x1, y1, x2, y2 = (int(m_overlay.group(i)) for i in (2, 3, 4, 5))
+            fname = m_overlay.group(6).strip()
+            data = b""
+            if base_dir is not None:
+                path = base_dir / fname
+                try:
+                    data = path.read_bytes()
+                except OSError as e:
+                    raise ValueError(
+                        f"compose: missing sidecar {path!r}: {e}") from e
+            ov = UHSNode(type="Overlay", content=ov_title,
+                         kind="image", binary=data or None,
+                         zone=(x1, y1, x2, y2))
+            pending_hotspot.children.append(ov)
+            continue
+
+        # `> Sound file: foo.sound.1.wav` attaches sidecar bytes to the
+        # most recently opened Sound node as its SoundData child.
+        m_sound_file = _SOUND_FILE_RE.match(ln)
+        if m_sound_file and pending_sound is not None:
+            fname = m_sound_file.group(1).strip()
+            data = b""
+            if base_dir is not None:
+                path = base_dir / fname
+                try:
+                    data = path.read_bytes()
+                except OSError as e:
+                    raise ValueError(
+                        f"compose: missing sidecar {path!r}: {e}") from e
+            sd = UHSNode(type="SoundData", content="^AUDIO^",
+                         kind="audio", binary=data or None)
+            pending_sound.children.append(sd)
             continue
 
         # Continuation of a `> ...` blockquote? Append to the last opened
@@ -1748,7 +1945,9 @@ def cmd_compose(args, cfg, log, paint):
         print("       run `my-uhs notes <name>` first.", file=sys.stderr)
         return 1
 
-    title, root = parse_notes_markdown(notes_path.read_text(encoding="utf-8"))
+    title, root = parse_notes_markdown(
+        notes_path.read_text(encoding="utf-8"),
+        base_dir=notes_path.parent)
     if not root.children:
         print("my-uhs: notes file has no chapters (## headings)",
               file=sys.stderr)
@@ -2404,6 +2603,7 @@ class UHSInteractive:
         "Comment", "CommentData", "Credit", "CreditData",
         "Info", "InfoData", "Incentive", "IncentiveData", "Link",
         "Text", "TextData",
+        "HotSpot", "Image", "Overlay", "Sound", "SoundData",
         "Version", "VersionData", "Blank",
     }
 
