@@ -943,6 +943,20 @@ def _enc_nest_string(s: str, key: List[int]) -> str:
     return "".join(out)
 
 
+def _enc_text_hunk(s: str, key: List[int]) -> str:
+    """Inverse of decrypt_text_hunk: same shape as _enc_nest_string but
+    using `co = i % klen` for both the key index and the +40 offset."""
+    out = []
+    klen = len(key)
+    for i, ch in enumerate(s):
+        co = i % klen
+        v = ord(ch) + (key[co] ^ (co + 40))
+        while v > 127:
+            v -= 96
+        out.append(chr(v))
+    return "".join(out)
+
+
 def _count_lines(node: UHSNode) -> int:
     """How many file-lines this node and its descendants will occupy.
     The header line (e.g. '5 subject') counts as 1; then title; then
@@ -989,6 +1003,9 @@ def _count_lines(node: UHSNode) -> int:
         return 2
     if t == "Link":
         # header + title + target id
+        return 3
+    if t == "Text":
+        # header + title + spec line (offset/length into binary tail)
         return 3
     if t == "Blank":
         return 1   # just the header
@@ -1094,6 +1111,18 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
         if -1 != getattr(node, "_remap_target", -1):
             target = node._remap_target
         out.append(str(target))
+
+    elif t == "Text":
+        out.append(f"{n_lines} text")
+        out.append(_sanitise(node.content))
+        # Placeholder spec line — encode_uhs's two-pass layout patches
+        # the offset+length once the binary tail position is known.
+        # Format: 9-digit-id, '0', 10-digit offset, 10-digit length.
+        out.append("000000000 0 0000000000 0000000000")
+        # Stamp the line index back onto the node so encode_uhs can find
+        # it. Body indexing is via len(out) BEFORE the just-appended
+        # spec line was added; we want the spec line itself.
+        node._spec_line_idx = len(out) - 1
 
     elif t == "Blank":
         out.append(f"{n_lines} blank")
@@ -1202,9 +1231,56 @@ def encode_uhs(root: UHSNode, master_title: str, version_label: str = "96a",
     # Header: "UHS\r\n" + master_title + "\r\n" + "1\r\n" + endHintSection + "\r\n"
     header = ["UHS", master_title, "1", str(len(body_lines) + 100)]
     all_lines = header + filler + body_lines
-    text = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
-    # No binary tail needed for the node types we emit.
-    return text + b"\x1a"
+
+    # Collect Text nodes; if any, the file needs a binary tail. The Text
+    # spec lines emitted above are fixed-width placeholders, so the body
+    # byte size doesn't change when we patch in real offsets/lengths.
+    text_blocks: List[bytes] = []
+    text_specs: List[Tuple[int, int]] = []  # (body_lines index, length)
+    body_offset_in_all = len(header) + len(filler)
+
+    def collect_text(n: UHSNode) -> None:
+        if n.type == "Text":
+            data = ""
+            if n.children and n.children[0].type == "TextData":
+                data = n.children[0].content
+            data = _sanitise(data)
+            ln_lines = data.split("\n")
+            encoded_lines = [_enc_text_hunk(ln, key) for ln in ln_lines]
+            block = ("\r\n".join(encoded_lines) + "\r\n").encode("latin-1")
+            text_blocks.append(block)
+            spec_idx_in_body = getattr(n, "_spec_line_idx", -1)
+            if spec_idx_in_body >= 0:
+                text_specs.append((spec_idx_in_body, len(block)))
+        for c in n.children:
+            collect_text(c)
+    collect_text(master)
+
+    if not text_blocks:
+        text = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
+        return text + b"\x1a"
+
+    # File layout: text_bytes + '\x1a' + binary_tail. The parser locates
+    # the boundary via data.find(b'\x1a'), so the binary tail starts at
+    # (header+body byte length) + 1 (for the \x1a separator itself).
+    text_bytes = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
+    binary_tail_start = len(text_bytes) + 1
+
+    cursor = binary_tail_start
+    for body_idx, length in text_specs:
+        all_idx = body_offset_in_all + body_idx
+        all_lines[all_idx] = (
+            f"000000000 0 {cursor:010d} {length:010d}")
+        cursor += length
+
+    text_bytes_final = ("\r\n".join(all_lines) + "\r\n").encode("latin-1")
+    if len(text_bytes_final) != len(text_bytes):
+        raise RuntimeError(
+            f"encode_uhs: text section size shifted after patching "
+            f"({len(text_bytes)} → {len(text_bytes_final)}); "
+            f"placeholder widths must match real values")
+
+    return text_bytes_final + b"\x1a" + b"".join(text_blocks)
 
 
 
