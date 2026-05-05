@@ -30,7 +30,7 @@ import sys
 # SCRIPT_COMMIT is baked in via `--stamp-version` so deployed copies (no
 # .git alongside) still print the commit they were built from.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "v2.3"
+SCRIPT_VERSION = "v2.4"
 SCRIPT_COMMIT  = ""
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
