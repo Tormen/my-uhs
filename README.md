@@ -8,8 +8,8 @@ The hint-file parser is a faithful port of David Millis'
 [OpenUHS](https://github.com/Vhati/OpenUHS) (Java, GPLv2+, 2012). It supports
 both 88a (1988) and 91a/96a (1991+) format files. Output of `my-uhs read` has
 been verified bit-identical to `OpenUHS --print` across a regression set of 12
-real-world hint files spanning the entire format range from *Alone in the Dark*
-(1993) to *Art of Murder 3* (2012).
+real-world hint files spanning the entire format range from the earliest 88a
+files (late 1980s) through 91a/96a releases up to the early 2010s.
 
 ## Why this exists
 
@@ -25,7 +25,8 @@ Drop the `my-uhs` script anywhere on your `$PATH` and `chmod +x` it:
 
 ```sh
 install -m 0755 my-uhs /usr/local/bin/my-uhs
-my-uhs --create-config            # write default config to ~/.my-uhs.conf
+my-uhs --create-config ~/.my-uhs.conf   # write the default config to that path
+# (bare `--create-config` prints to stdout — pipe or redirect as you like)
 ```
 
 Requirements: Python 3.7+. macOS ships 3.9 in Sonoma and later.
@@ -33,14 +34,14 @@ Requirements: Python 3.7+. macOS ships 3.9 in Sonoma and later.
 ## Quick start
 
 ```sh
-my-uhs --create-config            # writes ~/.my-uhs.conf with defaults
-my-uhs catalog --search portal    # browse the remote catalog
-my-uhs pull portal                # substring is enough — exact name not required
-my-uhs pull "ace attorney"        # multiple matches → interactive prompt
+my-uhs --create-config ~/.my-uhs.conf   # write defaults to that path
+my-uhs catalog --search <term>    # browse the remote catalog
+my-uhs pull <name>                # substring is enough — exact name not required
+my-uhs pull "<two words>"         # multiple matches → interactive prompt
 my-uhs pull all --yes             # download everything (warning: hundreds of MB)
 my-uhs list                       # show what's in the local catalog
-my-uhs list --search alone        # filter the local catalog
-my-uhs read portal.uhs            # render with color
+my-uhs list --search <term>       # filter the local catalog
+my-uhs read <name>.uhs            # render with color
 my-uhs read /tmp/somefile.uhs     # also accepts a direct path
 my-uhs push /tmp/myhints.uhs      # register a local file in the catalog
 ```
@@ -55,17 +56,19 @@ my-uhs push /tmp/myhints.uhs      # register a local file in the catalog
 | `test FILE` | Quietly parse and report success or failure. Exit code 0 on success. |
 | `list [--search TERM]` | List entries in the local catalog. With `--search`, filter by title/filename substring. |
 | `catalog [--search TERM]` | Refresh the cached remote catalog index from `uhs-hints.com` and list entries. |
-| `pull NAME [--yes] [--force]` | Download from the remote catalog. NAME may be an exact filename (`alone.uhs`), a title or filename substring (`alone`, `ace attorney`), or `all`. Multiple matches prompt unless `--yes`. |
+| `pull NAME [--yes] [--force]` | Download from the remote catalog. NAME may be an exact filename (`<name>.uhs`), a title or filename substring, or `all`. Multiple matches prompt unless `--yes`. |
 | `push FILE` | Register an existing local `.uhs` file into the catalog. Use `--name` to override the catalog key, `--force` to overwrite. |
 | `notes NAME` | Open a markdown notes file for a game in `$EDITOR` (creates a UHS-shaped template on first run). For authoring your own hints as you play. |
-| `compose NAME` | Convert a notes markdown file into a real binary `.uhs` and register it in the local catalog, readable by `my-uhs read` like any other entry. |
+| `compose NAME [--force]` | Convert a notes markdown file into a real binary `.uhs` and register it in the local catalog, readable by `my-uhs read` like any other entry. `--force` overwrites an existing entry. |
+| `export NAME` | Inverse of `compose`: dump an existing `.uhs` from the catalog back to markdown under `notes/<NAME>.md` (round-trip authoring). Image and sound binaries are written as sidecar files. |
+| `use NAME` | Interactive hint reveal. Walk chapters → questions → hints one keypress at a time. Quit with `q`; resume picks up at the same question and the same hint number you left off on. |
 
 ## Global flags
 
 | Flag | Effect |
 | --- | --- |
 | `-c PATH` / `--config PATH` | Use a specific config file (skips the search list). |
-| `--create-config` | Write a default config file. With `--config PATH` writes there; otherwise picks the highest-priority writable location from the search list. |
+| `--create-config [PATH]` | Without `PATH`: print the default config to stdout (pipe or redirect as you like). With `PATH`: write the default to that file (refuses to overwrite an existing file). |
 | `-D` / `--debug` | Enable verbose logging to the configured logfile. |
 | `--no-color` | Disable ANSI color even on a TTY. |
 | `--version` | Print version. |
@@ -83,9 +86,10 @@ Format: standard INI with a single `[my-uhs]` section.
 3. `/etc/my-uhs.conf`
 4. `/usr/local/etc/my-uhs.conf`
 
-`--config PATH` overrides the search entirely. `--create-config` writes a
-fully-commented default to whichever of those paths is first writable (or to
-`--config PATH` if given).
+`--config PATH` overrides the search entirely. `--create-config` (no
+argument) prints the fully-commented default config to stdout; pass an
+explicit target path (`--create-config ~/.my-uhs.conf`) to write it to a
+file. The file form refuses to overwrite an existing file.
 
 ### Keys
 
@@ -119,12 +123,12 @@ as you play a game, jotting down nudges and solutions. Then
 catalog.
 
 ```sh
-my-uhs notes memoria        # opens ~/.my-uhs.catalog/notes/memoria.md
+my-uhs notes <name>         # opens ~/.my-uhs.catalog/notes/<name>.md
 # ... edit the template, fill in your puzzles and hints ...
-my-uhs compose memoria      # creates memoria.uhs in the catalog
-my-uhs read memoria.uhs     # read it back, colorized
+my-uhs compose <name>       # creates <name>.uhs in the catalog
+my-uhs read <name>.uhs      # read it back, colorized
 # Edit the markdown again later, then:
-my-uhs compose --force memoria   # overwrite the existing .uhs
+my-uhs compose --force <name>    # overwrite the existing .uhs
 ```
 
 The markdown format is intentionally minimal:
@@ -169,11 +173,11 @@ dropped with a `?` placeholder.
 ├── index.json           # local catalog (title, version, size, source, mtime)
 ├── remote-catalog.xml   # last-fetched raw remote catalog
 ├── files/
-│   ├── alone.uhs
-│   ├── portal.uhs
+│   ├── <name>.uhs
+│   ├── <name>.uhs
 │   └── …
 └── notes/
-    ├── memoria.md       # source markdown for `compose`
+    ├── <name>.md        # source markdown for `compose`
     └── …
 ```
 
@@ -254,8 +258,9 @@ without saving.
 
 `my-uhs read` produces byte-identical output to `java -jar openuhs.jar
 --print` across the regression set. The single observed deviation is in
-`apollo-justice.uhs` where Java's `System.out` corrupts the UTF-8 character
-`é` to `?` due to default-encoding quirks; `my-uhs` writes valid UTF-8.
+one file in the regression set where Java's `System.out` corrupts the UTF-8
+character `é` to `?` due to default-encoding quirks; `my-uhs` writes valid
+UTF-8.
 
 ## Limitations
 
