@@ -5,6 +5,7 @@ testing/samples/
 testing/expected/
 testing/actual/
 testing/.openuhs/
+testing/openuhs-src/
 testing/.catalog/
 testing/.regression.conf
 testing/.test.log

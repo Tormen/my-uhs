@@ -294,10 +294,36 @@ class UHSNode:
     id: int = -1
     link_target: int = -1
     children: List["UHSNode"] = field(default_factory=list)
+    # Real binary blob for Image/SoundData (populated by the parser when a
+    # node references an offset+length in the binary tail). None means the
+    # parser skipped extraction (legacy behavior or read failure).
+    binary: Optional[bytes] = None
+    # HyperImage zone coordinates (x1, y1, x2, y2) for nodes attached as
+    # spot regions. None when not a HotSpot zone target.
+    zone: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def is_link(self) -> bool:
         return self.link_target != -1
+
+
+# Magic-byte → (extension, MIME) map for binary blobs in the .uhs tail.
+def _detect_binary_kind(b: bytes) -> Tuple[str, str]:
+    if not b:
+        return ("bin", "application/octet-stream")
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return ("png", "image/png")
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return ("gif", "image/gif")
+    if b[:3] == b"\xff\xd8\xff":
+        return ("jpg", "image/jpeg")
+    if b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return ("wav", "audio/wav")
+    if b[:3] == b"ID3" or (len(b) >= 2 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):
+        return ("mp3", "audio/mpeg")
+    if b[:4] == b"OggS":
+        return ("ogg", "audio/ogg")
+    return ("bin", "application/octet-stream")
 
 
 class UHSParseError(Exception):
@@ -869,26 +895,124 @@ def _parse_incentive(body, raw, raw_off, root, cur, key, start, count, log):
     return count
 
 
-def _parse_skip_image(body, raw, raw_off, root, cur, key, start, count, log):
-    """hyperpng / gifa: emit a HotSpot wrapper (string title, with id) holding
-    an Image child (kind='image'). We don't actually render the image bytes,
-    so child regions are skipped — but the on-disk byte count is consumed
-    so the dispatcher's index stays in sync with the file."""
+def _parse_image(body, raw, raw_off, root, cur, key, start, count, log):
+    """hyperpng / gifa: read main image bytes, then per-zone children.
+    Format (per OpenUHSLib's parseHyperImageNode):
+
+        <count> hyperpng | gifa
+        <title>
+        <id> <offset> <length>      (3 tokens — main image spec)
+        <x1> <y1> <x2> <y2>         (zone coords, then a nested hunk)
+        <inner-hunk lines...>
+        ...
+
+    Inner hunks may be: link, overlay, hyperpng, gifa, text, hint.
+    """
     title = parse_text_escapes(_line(body, start + 1))
     wrap = UHSNode(type="HotSpot", content=title)
     _add_child(root, cur, wrap, start)
-    wrap.children.append(UHSNode(type="Image", content="^IMAGE^", kind="image"))
+
+    spec = _line(body, start + 2).split(" ")
+    img = UHSNode(type="Image", content="^IMAGE^", kind="image")
+    if len(spec) >= 3 and raw_off != -1:
+        try:
+            offset = int(spec[-2]) - raw_off
+            length = int(spec[-1])
+            if 0 <= offset and offset + length <= len(raw):
+                img.binary = raw[offset:offset + length]
+        except ValueError as e:
+            log.debug("hyperpng main spec bad: %r (%s)", spec, e)
+    wrap.children.append(img)
+
+    # Zones are at start+3 onward, until inner_end = start+count.
+    inner_end = start + count
+    j = start + 3
+    while j < inner_end:
+        zone_line = _line(body, j)
+        zone_parts = zone_line.split(" ")
+        if len(zone_parts) != 4:
+            log.debug("hyperpng: expected 4-token zone line at %d, "
+                      "got %r — skipping", j, zone_line)
+            j += 1
+            continue
+        try:
+            x1, y1, x2, y2 = (int(zone_parts[i]) for i in range(4))
+        except ValueError:
+            j += 1
+            continue
+        # Next line is the hunk type / count.
+        head = _line(body, j + 1)
+        m = re.match(r"^(\d+)\s+(\w+)\s*$", head)
+        if not m:
+            j += 1
+            continue
+        inner_count = int(m.group(1))
+        inner_kind = m.group(2)
+
+        if inner_kind == "overlay":
+            ov_title = _line(body, j + 2)
+            ov_spec = _line(body, j + 3).split(" ")
+            ov = UHSNode(type="Overlay",
+                         content=parse_text_escapes(ov_title),
+                         kind="image",
+                         zone=(x1, y1, x2, y2))
+            if len(ov_spec) >= 3 and raw_off != -1:
+                try:
+                    ofs = int(ov_spec[-4]) - raw_off
+                    leng = int(ov_spec[-3])
+                    if 0 <= ofs and ofs + leng <= len(raw):
+                        ov.binary = raw[ofs:ofs + leng]
+                except (ValueError, IndexError):
+                    pass
+            wrap.children.append(ov)
+            j += 1 + inner_count   # zone + inner_count lines consumed
+        else:
+            # Recurse into the inner hunk; result attaches to wrap with
+            # the zone coords stamped on it.
+            kids_before = len(wrap.children)
+            consumed = _build_nodes(
+                body, raw, raw_off, root, wrap, key, j + 1, log)
+            if len(wrap.children) == kids_before + 1:
+                wrap.children[-1].zone = (x1, y1, x2, y2)
+            j = consumed
+            # _build_nodes returns the absolute index of the next line, so
+            # the j increment is implicit. Add 1 for the zone line we
+            # already consumed (it sits before the hunk header).
+            # Note: consumed is start+inner_count for the parsed hunk, so
+            # j is now correctly past it. The zone line itself was at j-1
+            # (we passed j+1 to _build_nodes). Fix: we need to add 1
+            # because _build_nodes was called with j+1, not j.
+            # Actually _build_nodes returns next absolute index after
+            # parsing one node; that index already accounts for the hunk
+            # but NOT for the zone line we read at j. Compensate by NOT
+            # adding 1 here — _build_nodes returned (j+1)+inner_count,
+            # which is past the entire zone+hunk pair. So j is correct.
     return count
 
 
-def _parse_skip_sound(body, raw, raw_off, root, cur, key, start, count, log):
-    """sound: emit a Sound wrapper (string title, with id) holding a
-    SoundData child (kind='audio')."""
+def _parse_sound(body, raw, raw_off, root, cur, key, start, count, log):
+    """sound: <count> sound / title / <id> <offset> <length>"""
     title = parse_text_escapes(_line(body, start + 1))
     wrap = UHSNode(type="Sound", content=title)
     _add_child(root, cur, wrap, start)
-    wrap.children.append(UHSNode(type="SoundData", content="^AUDIO^", kind="audio"))
+    sd = UHSNode(type="SoundData", content="^AUDIO^", kind="audio")
+    if count >= 3:
+        spec = _line(body, start + 2).split(" ")
+        if len(spec) >= 3 and raw_off != -1:
+            try:
+                offset = int(spec[-2]) - raw_off
+                length = int(spec[-1])
+                if 0 <= offset and offset + length <= len(raw):
+                    sd.binary = raw[offset:offset + length]
+            except ValueError as e:
+                log.debug("sound spec bad: %r (%s)", spec, e)
+    wrap.children.append(sd)
     return count
+
+
+# Backwards-compat aliases used by the dispatch table.
+_parse_skip_image = _parse_image
+_parse_skip_sound = _parse_sound
 
 
 def _parse_unknown(body, raw, raw_off, root, cur, key, start, count, log):
