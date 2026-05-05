@@ -86,7 +86,33 @@ def main() -> int:
         for f in failures:
             print("FAIL:", f)
         return 1
-    print("OK: Text node round-trip clean (binary-tail encoder + parser)")
+
+    # ---- markdown round-trip: parsed -> export-md -> parse_notes -> encode -> parse ----
+    md = m.serialize_uhs_to_notes_md(parsed)
+    title2, root2 = m.parse_notes_markdown(md)
+    blob2 = m.encode_uhs(root2, master_title=title2)
+    fp = tempfile.NamedTemporaryFile(
+        suffix=".uhs", delete=False, dir=str(HERE))
+    fp.write(blob2); fp.close()
+    try:
+        parsed2, _ = m.parse_uhs(fp.name, log)
+    finally:
+        Path(fp.name).unlink(missing_ok=True)
+    txt2 = find_first(parsed2, "Text")
+    if txt2 is None:
+        failures.append("[md] Text node not preserved")
+    elif not txt2.children or txt2.children[0].type != "TextData":
+        failures.append("[md] TextData missing")
+    elif txt2.children[0].content != PAYLOAD:
+        failures.append(
+            f"[md] TextData mismatch:\n  want {PAYLOAD!r}\n  got  "
+            f"{txt2.children[0].content!r}")
+
+    if failures:
+        for f in failures:
+            print("FAIL:", f)
+        return 1
+    print("OK: Text node round-trip clean (binary + markdown)")
     return 0
 
 

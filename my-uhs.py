@@ -1381,6 +1381,11 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
     # Last opened blockquote-style data node (Comment/Credit/Info/Incentive)
     # — receives subsequent unprefixed `> ` continuation lines.
     current_blockquote_data: Optional[UHSNode] = None
+    # `### Text: Title` opens a Text node; the next fenced ``` block's
+    # body lines are gathered into this node's TextData child.
+    pending_text_node: Optional[UHSNode] = None
+    pending_text_lines: List[str] = []
+    in_text_fence = False
     in_html_comment = False
 
     def attach_blockquote(parent: UHSNode, type_: str,
@@ -1394,8 +1399,34 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
         parent.children.append(wrap)
         return data
 
+    def _flush_pending_text() -> None:
+        nonlocal pending_text_node, pending_text_lines, in_text_fence
+        if pending_text_node is not None and pending_text_lines:
+            pending_text_node.children.append(
+                UHSNode(type="TextData",
+                        content="\n".join(pending_text_lines)))
+        pending_text_node = None
+        pending_text_lines = []
+        in_text_fence = False
+
     for raw in lines:
         ln = raw.rstrip()
+
+        # Fenced ```...``` block following a `### Text:` heading. Open
+        # fence on first ``` line, close on next ``` line, accumulate
+        # raw content lines (preserving indentation) in between.
+        if pending_text_node is not None:
+            stripped = ln.lstrip()
+            if stripped.startswith("```"):
+                if in_text_fence:
+                    _flush_pending_text()
+                else:
+                    in_text_fence = True
+                continue
+            if in_text_fence:
+                pending_text_lines.append(ln)
+                continue
+
         # Skip HTML comments (the embedded instructions in the template).
         if "<!--" in ln:
             in_html_comment = True
@@ -1423,6 +1454,26 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
             continue
         if ln.startswith("### "):
             body_text = ln[4:].strip()
+            # `### Text: Title` opens a Text node; the following fenced
+            # ```...``` block becomes its TextData content.
+            if body_text.lower().startswith("text:"):
+                title_text, marker_id = _strip_id_marker(
+                    body_text[5:].strip())
+                if current_subject is None:
+                    current_chapter = UHSNode(
+                        type="Subject", content="Hints")
+                    root.children.append(current_chapter)
+                    current_subject = current_chapter
+                txt = UHSNode(type="Text", content=title_text)
+                if marker_id != -1:
+                    txt.id = marker_id
+                current_subject.children.append(txt)
+                pending_text_node = txt
+                pending_text_lines = []
+                in_text_fence = False
+                current_question = None
+                current_blockquote_data = None
+                continue
             # `### Sub: Title` opens a nested Subject under the current
             # top-level chapter. Subsequent Questions attach to it.
             if body_text.lower().startswith("sub:"):
@@ -1529,6 +1580,7 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
         # Anything else is silently ignored — the file can hold the user's
         # own freeform notes alongside the structured content.
 
+    _flush_pending_text()
     return title, root
 
 
@@ -1732,11 +1784,21 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
             tgt = c.link_target if c.link_target != -1 else 0
             out.append(f"[Link: {label} -> #{tgt}]")
             out.append("")
+        elif t == "Text":
+            title = _md_escape_inline(c.content or "(untitled)")
+            data = ""
+            if c.children and c.children[0].type == "TextData":
+                data = c.children[0].content
+            out.append(f"### Text: {title}{_id_marker(c)}")
+            out.append("```")
+            for ln in _md_escape_inline(data).split("\n"):
+                out.append(ln)
+            out.append("```")
+            out.append("")
         elif t in ("Version", "Blank"):
             # Encoder regenerates these — drop on export.
             pass
-        elif t in ("HotSpot", "Sound", "Image", "SoundData",
-                   "Text", "TextData"):
+        elif t in ("HotSpot", "Sound", "Image", "SoundData"):
             unsupported.append(t)
             label = (c.content or "")[:60]
             out.append(f"<!-- TODO(plan-2): {t} '{label}' "
@@ -2152,6 +2214,7 @@ class UHSInteractive:
         "Root", "Subject", "Question", "Hint",
         "Comment", "CommentData", "Credit", "CreditData",
         "Info", "InfoData", "Incentive", "IncentiveData", "Link",
+        "Text", "TextData",
         "Version", "VersionData", "Blank",
     }
 
