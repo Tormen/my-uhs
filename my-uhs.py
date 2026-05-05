@@ -1809,7 +1809,9 @@ def _emit_hint_md(content: str, out: List[str]) -> None:
         out.append(f"  {cont}" if cont else "  ")
 
 
-def serialize_uhs_to_notes_md(root: UHSNode) -> str:
+def serialize_uhs_to_notes_md(root: UHSNode,
+                              sidecar_paths: Optional[Dict[int, str]] = None
+                              ) -> str:
     """Serialize a parsed UHS tree back into the compose-grammar markdown
     notes format. Round-trips Subject/Question/Hint/Comment/Credit cleanly;
     Version/Blank are recreated by the encoder so they're omitted; HotSpot/
@@ -1922,12 +1924,41 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
         elif t in ("Version", "Blank"):
             # Encoder regenerates these — drop on export.
             pass
-        elif t in ("HotSpot", "Sound", "Image", "SoundData"):
-            unsupported.append(t)
-            label = (c.content or "")[:60]
-            out.append(f"<!-- TODO(plan-2): {t} '{label}' "
-                       f"not yet round-trippable -->")
+        elif t == "HotSpot":
+            label = _md_escape_inline(c.content or "(untitled)")
+            out.append(f"### Image: {label}{_id_marker(c)}")
+            # Find Image / Overlay children with sidecars; ignore any
+            # other deeply-nested children for now (not yet round-trip).
+            for child in c.children:
+                if (child.type in ("Image", "Overlay")
+                        and sidecar_paths is not None
+                        and id(child) in sidecar_paths):
+                    fname = sidecar_paths[id(child)]
+                    if child.type == "Overlay" and child.zone:
+                        x1, y1, x2, y2 = child.zone
+                        out.append(
+                            f"> Overlay: {_md_escape_inline(child.content or '')}"
+                            f" @ ({x1},{y1})-({x2},{y2}) — see {fname}")
+                    else:
+                        out.append(f"> Image file: {fname}")
+                elif child.type == "Image":
+                    out.append("> (image bytes not extracted)")
             out.append("")
+            # Plan #2: re-embedding requires the binary-tail encoder
+            # for HyperImage; until that lands, write back will warn.
+            unsupported.append(t)
+        elif t == "Sound":
+            label = _md_escape_inline(c.content or "(untitled)")
+            out.append(f"### Sound: {label}{_id_marker(c)}")
+            sd = next((cc for cc in c.children
+                       if cc.type == "SoundData"), None)
+            if (sd is not None and sidecar_paths is not None
+                    and id(sd) in sidecar_paths):
+                out.append(f"> Sound file: {sidecar_paths[id(sd)]}")
+            else:
+                out.append("> (sound bytes not extracted)")
+            out.append("")
+            unsupported.append(t)
         else:
             unsupported.append(t)
             out.append(f"<!-- TODO(plan-2): unhandled node type '{t}' -->")
@@ -1967,10 +1998,44 @@ def cmd_export(args, cfg, log, paint):
               file=sys.stderr)
         return 2
 
-    md = serialize_uhs_to_notes_md(root)
+    # Export sidecar binary blobs (plan #2 §2b). Numbering is 1-based
+    # in DFS order. Filenames are `<slug>.image.N.<ext>` and
+    # `<slug>.sound.N.<ext>` next to the .md.
+    dest_dir = dest.parent
+    dest_stem = dest.stem
+    sidecar_count = {"image": 0, "sound": 0}
+    sidecar_paths: Dict[int, str] = {}   # id(node) -> filename
+
+    def emit_sidecars(node: UHSNode) -> None:
+        if node.binary:
+            if node.type in ("Image", "Overlay"):
+                sidecar_count["image"] += 1
+                n = sidecar_count["image"]
+                ext, _ = _detect_binary_kind(node.binary)
+                fname = f"{dest_stem}.image.{n}.{ext}"
+                (dest_dir / fname).write_bytes(node.binary)
+                sidecar_paths[id(node)] = fname
+            elif node.type == "SoundData":
+                sidecar_count["sound"] += 1
+                n = sidecar_count["sound"]
+                ext, _ = _detect_binary_kind(node.binary)
+                fname = f"{dest_stem}.sound.{n}.{ext}"
+                (dest_dir / fname).write_bytes(node.binary)
+                sidecar_paths[id(node)] = fname
+        for c in node.children:
+            emit_sidecars(c)
+    emit_sidecars(root)
+
+    md = serialize_uhs_to_notes_md(root, sidecar_paths=sidecar_paths)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(md, encoding="utf-8")
+    n_img = sidecar_count["image"]
+    n_snd = sidecar_count["sound"]
     print(paint(f"exported → {dest}", C.OK))
+    if n_img or n_snd:
+        print(paint(
+            f"  + {n_img} image sidecar{'s' if n_img != 1 else ''}, "
+            f"{n_snd} sound sidecar{'s' if n_snd != 1 else ''}", C.META))
     print(paint(f"# edit, then: my-uhs compose {slug} --force", C.META))
     return 0
 
