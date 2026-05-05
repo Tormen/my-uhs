@@ -27,7 +27,7 @@ import sys
 VENV_DIR = os.path.expanduser("~/.python.venv/my-uhs")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
 VENV_DEPS: list = [
-    # "Pillow",   # enable when plan #2 zone-overlay preview lands
+    "Pillow",   # zone-overlay rendering for `use` HotSpot preview
 ]
 
 
@@ -2395,7 +2395,7 @@ class UHSInteractive:
     """Stack-based interactive walker over a parsed UHS tree."""
 
     # Node types that act as navigable containers in the menu.
-    NAVIGABLE = {"Subject", "Question"}
+    NAVIGABLE = {"Subject", "Question", "HotSpot", "Sound"}
 
     # Node types the encoder can faithfully round-trip. Files containing
     # anything outside this set cannot be safely re-saved after an edit.
@@ -2420,6 +2420,8 @@ class UHSInteractive:
         self.state_key = state_key
         self.source_path = source_path
         self._resumed = self._restore_state()
+        # Per-session temp dir for previewed binaries; cleaned at quit.
+        self._tmp_dir: Optional[Path] = None
 
     # --- persistent location (resume across runs) ---
 
@@ -2481,6 +2483,112 @@ class UHSInteractive:
                     encoding="utf-8")
             except OSError:
                 pass
+
+    # --- preview / play binary content (plan #2 §3) ---
+
+    def _ensure_tmp_dir(self) -> Path:
+        if self._tmp_dir is None:
+            import tempfile
+            self._tmp_dir = Path(tempfile.mkdtemp(prefix="my-uhs-"))
+        return self._tmp_dir
+
+    def _cleanup_tmp_dir(self) -> None:
+        if self._tmp_dir is None:
+            return
+        try:
+            for f in self._tmp_dir.iterdir():
+                try: f.unlink()
+                except OSError: pass
+            self._tmp_dir.rmdir()
+        except OSError:
+            pass
+        self._tmp_dir = None
+
+    def _annotated_image_bytes(
+            self, raw: bytes, zones: List[Tuple[int, int, int, int]],
+            color: str = "#FF0000") -> Optional[bytes]:
+        """Return PNG bytes with zone rectangles drawn on top. Requires
+        Pillow (added to VENV_DEPS when zone-overlay lands as default).
+        Falls back to None when Pillow isn't installed — callers then
+        show the un-annotated image and print zone coords in the menu."""
+        try:
+            from PIL import Image, ImageDraw  # type: ignore
+        except ImportError:
+            return None
+        try:
+            from io import BytesIO
+            img = Image.open(BytesIO(raw)).convert("RGBA")
+            draw = ImageDraw.Draw(img)
+            for i, (x1, y1, x2, y2) in enumerate(zones, 1):
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+                draw.text((x1 + 2, y1 + 2), str(i), fill=color)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def _preview_image(self, hotspot: "UHSNode") -> None:
+        """Open the HotSpot's main image in macOS Preview / xdg-open.
+        If zones are present and Pillow is installed, draw zone outlines
+        first; else show un-annotated and list zones in the terminal."""
+        img_node = next((c for c in hotspot.children
+                         if c.type == "Image" and c.binary), None)
+        if img_node is None:
+            print(self.paint("  no extractable image bytes here.", C.WARN))
+            return
+        zones: List[Tuple[int, int, int, int]] = []
+        zone_labels: List[str] = []
+        for c in hotspot.children:
+            if c.zone is not None:
+                zones.append(c.zone)
+                zone_labels.append(c.content or c.type)
+        ext, _ = _detect_binary_kind(img_node.binary)
+        body = img_node.binary
+        if zones:
+            annotated = self._annotated_image_bytes(body, zones)
+            if annotated is not None:
+                body = annotated
+                ext = "png"
+                print(self.paint(
+                    f"  drew {len(zones)} zone rectangle(s) "
+                    f"in red on a copy.", C.INFO))
+            else:
+                print(self.paint(
+                    "  Pillow not installed — preview will show the "
+                    "image WITHOUT zone overlays. Zones:", C.WARN))
+                for i, (z, lbl) in enumerate(zip(zones, zone_labels), 1):
+                    print(self.paint(
+                        f"    {i}. ({z[0]},{z[1]})-({z[2]},{z[3]}) "
+                        f"{lbl}", C.META))
+        tmp_dir = self._ensure_tmp_dir()
+        slug = (hotspot.content or "image").replace("/", "_")[:40]
+        tmp = tmp_dir / f"{slug}.{ext}"
+        tmp.write_bytes(body)
+        if sys.platform == "darwin":
+            os.system(f'open -a Preview "{tmp}" >/dev/null 2>&1')
+        else:
+            os.system(f'xdg-open "{tmp}" >/dev/null 2>&1 &')
+        print(self.paint(f"  → opened {tmp}", C.OK))
+
+    def _play_sound(self, sound: "UHSNode") -> None:
+        sd = next((c for c in sound.children
+                   if c.type == "SoundData" and c.binary), None)
+        if sd is None:
+            print(self.paint("  no extractable audio bytes here.", C.WARN))
+            return
+        ext, _ = _detect_binary_kind(sd.binary)
+        tmp_dir = self._ensure_tmp_dir()
+        slug = (sound.content or "sound").replace("/", "_")[:40]
+        tmp = tmp_dir / f"{slug}.{ext}"
+        tmp.write_bytes(sd.binary)
+        if sys.platform == "darwin":
+            # afplay blocks until done; run in background so the prompt
+            # stays usable. (Could use 'afplay tmp &'.)
+            os.system(f'afplay "{tmp}" >/dev/null 2>&1 &')
+        else:
+            os.system(f'aplay "{tmp}" >/dev/null 2>&1 &')
+        print(self.paint(f"  → playing {tmp}", C.OK))
 
     # --- non-recursive in-place edit ---
 
@@ -2742,15 +2850,26 @@ class UHSInteractive:
             print(self.paint("  (no chapters or questions here)", C.WARN))
         else:
             for i, c in enumerate(kids, 1):
-                marker = "?" if c.type == "Question" else "/"
-                color = C.QUESTION if c.type == "Question" else C.SUBJECT
+                if c.type == "Question":
+                    marker, color = "?", C.QUESTION
+                elif c.type == "HotSpot":
+                    marker, color = "📷", C.LINK
+                elif c.type == "Sound":
+                    marker, color = "🔊", C.LINK
+                else:
+                    marker, color = "/", C.SUBJECT
                 label = c.content or "(untitled)"
                 tail = ""
                 if c.is_link:
                     tail = self.paint(f"  → link {c.link_target}", C.META)
                 print(f"  {i:>3}. {marker} {self.paint(label, color)}{tail}")
+        # `p=preview` only meaningful when this node IS or CONTAINS a
+        # binary node we can preview/play. Show conditionally.
+        is_binary_node = node.type in ("HotSpot", "Sound")
+        prompt_extra = "  p=preview" if is_binary_node else ""
         ans = self._ask(self.paint(
-            "  [number]=open  e=edit  b=back  c=chapters  q=quit > ",
+            f"  [number]=open  e=edit{prompt_extra}  "
+            f"b=back  c=chapters  q=quit > ",
             C.HINT))
         if ans is None or ans in ("q", "quit", "exit"):
             return False
@@ -2765,6 +2884,12 @@ class UHSInteractive:
             return True
         if ans in ("e", "edit"):
             self._edit_current()
+            return True
+        if ans in ("p", "preview", "play") and is_binary_node:
+            if node.type == "HotSpot":
+                self._preview_image(node)
+            else:
+                self._play_sound(node)
             return True
         if ans == "":
             return True
@@ -2882,6 +3007,7 @@ class UHSInteractive:
                     break
         finally:
             self.save_state()
+            self._cleanup_tmp_dir()
             if self.state_path and self.state_key:
                 if len(self.stack) > 1:
                     print(self.paint(
