@@ -24,6 +24,103 @@ import os
 import subprocess
 import sys
 
+# ---------------------------------------------------------------------------
+# Version / license constants (same pattern as my-plex).
+# SCRIPT_VERSION tracks the latest git tag; bump in lockstep with `git tag`.
+# SCRIPT_COMMIT is baked in via `--stamp-version` so deployed copies (no
+# .git alongside) still print the commit they were built from.
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "v2.3"
+SCRIPT_COMMIT  = ""
+SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
+SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
+SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
+
+
+def _script_version_string() -> str:
+    """SCRIPT_VERSION + commit sha (baked or live, with -dirty suffix)."""
+    sha = SCRIPT_COMMIT
+    if not sha:
+        try:
+            here = os.path.dirname(os.path.realpath(__file__))
+            r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and r.stdout.strip():
+                sha = r.stdout.strip()
+                d  = subprocess.run(["git", "-C", here, "diff", "--quiet"],
+                                    capture_output=True, timeout=2)
+                ds = subprocess.run(["git", "-C", here, "diff", "--cached", "--quiet"],
+                                    capture_output=True, timeout=2)
+                if d.returncode != 0 or ds.returncode != 0:
+                    sha += "-dirty"
+        except Exception:
+            pass
+    return f"{SCRIPT_VERSION} ({sha})" if sha else SCRIPT_VERSION
+
+
+def _print_version_and_exit() -> None:
+    print(f"my-uhs {_script_version_string()}")
+    print(SCRIPT_COPYRIGHT)
+    print(f"License: {SCRIPT_LICENSE_SHORT}")
+    print(f"         {SCRIPT_LICENSE_URL}")
+    print()
+    print("This is free software: you are free to redistribute and modify it")
+    print("under the terms of the GNU General Public License as published by")
+    print("the Free Software Foundation, either version 2 of the License or")
+    print("(at your option) any later version.")
+    print()
+    print("This program comes with ABSOLUTELY NO WARRANTY.")
+    print("Derivative works MUST be released under a compatible copyleft")
+    print('license (this is the "copyleft" obligation of the GPL).')
+    print()
+    print("Hint-file parser ported from David Millis' OpenUHS (GPLv2+, 2012)")
+    print("— https://github.com/Vhati/OpenUHS")
+    sys.exit(0)
+
+
+def _stamp_version_and_exit() -> None:
+    """Bake current HEAD short sha into SCRIPT_COMMIT and amend the commit."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    self_path = os.path.realpath(__file__)
+    r = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"ERROR: Not in a git repo (script dir: {here})", file=sys.stderr)
+        sys.exit(1)
+    new_sha = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+    with open(self_path) as f:
+        src = f.read()
+    import re as _re
+    new_src, n = _re.subn(r'^SCRIPT_COMMIT\s*=\s*"[^"]*"',
+                          f'SCRIPT_COMMIT  = "{new_sha}"',
+                          src, count=1, flags=_re.MULTILINE)
+    if n == 0:
+        print("ERROR: Could not find SCRIPT_COMMIT line to stamp.", file=sys.stderr)
+        sys.exit(1)
+    if new_src == src:
+        print(f"SCRIPT_COMMIT already matches HEAD ({new_sha}); nothing to do.")
+        sys.exit(0)
+    with open(self_path, "w") as f:
+        f.write(new_src)
+    subprocess.run(["git", "-C", here, "add", self_path], check=True)
+    subprocess.run(["git", "-C", here, "commit", "--amend", "--no-edit", "--no-verify"],
+                   check=True)
+    final_sha = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+    print(f"Stamped SCRIPT_COMMIT='{new_sha}'; HEAD is now '{final_sha}'.")
+    print("Note: amend rewrote HEAD's sha, so SCRIPT_COMMIT lags HEAD by 1.")
+    sys.exit(0)
+
+
+# Handle --version / --stamp-version before venv bootstrap so they work
+# without Pillow installed.
+if any(a in ("--version", "-version", "-V") for a in sys.argv[1:]):
+    _print_version_and_exit()
+if "--stamp-version" in sys.argv[1:]:
+    _stamp_version_and_exit()
+
+
 VENV_DIR = os.path.expanduser("~/.python.venv/my-uhs")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
 VENV_DEPS: list = [
@@ -104,7 +201,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "0.1.0"
+__version__ = SCRIPT_VERSION.lstrip("v")
 
 # ---------------------------------------------------------------------------
 # Config — search paths, defaults, load, write-default
@@ -2628,6 +2725,11 @@ class UHSInteractive:
         self.state_path = state_path
         self.state_key = state_key
         self.source_path = source_path
+        # Hint-reveal counter that survives a quit. Set just before
+        # _show_hints returns False so save_state can persist it; consumed
+        # (and zeroed) the next time _show_hints opens the same Question.
+        self._last_hint_revealed: int = 0
+        self._resume_revealed: int = 0
         self._resumed = self._restore_state()
         # Per-session temp dir for previewed binaries; cleaned at quit.
         self._tmp_dir: Optional[Path] = None
@@ -2643,31 +2745,70 @@ class UHSInteractive:
         except (OSError, json.JSONDecodeError):
             return {}
 
+    def _find_child_by_title(self, parent: "UHSNode",
+                             title: str) -> Optional["UHSNode"]:
+        """Look up a navigable child of `parent` by exact title match.
+        Used as a fallback when an id-based lookup fails after a recompose
+        renumbers the tree."""
+        for c in parent.children:
+            if c.type in self.NAVIGABLE and (c.content or "") == title:
+                return c
+        return None
+
     def _restore_state(self) -> bool:
         if not (self.state_path and self.state_key):
             return False
         blob = self._load_state_blob()
-        ids = blob.get(self.state_key, {}).get("stack", [])
-        if not ids:
+        entry = blob.get(self.state_key, {})
+        ids = entry.get("stack", [])
+        titles = entry.get("titles", [])
+        if not ids and not titles:
             return False
+        # Walk the saved path. Prefer id lookup; fall back to title match in
+        # the parent so a recompose (which renumbers ids) doesn't lose us.
+        # On the first irrecoverable miss, stop where we are -- the user
+        # ends up at the deepest reachable ancestor instead of the root.
         nodes = [self.root]
-        for nid in ids:
-            n = self.id_map.get(nid)
-            if not n:
-                # Tree changed; bail to root rather than crash.
-                return False
+        cur = self.root
+        for i in range(max(len(ids), len(titles))):
+            nid    = ids[i]    if i < len(ids)    else None
+            title  = titles[i] if i < len(titles) else None
+            n: Optional["UHSNode"] = None
+            if nid is not None:
+                n = self.id_map.get(nid)
+                # An id can collide with a non-navigable node after recompose;
+                # reject those so we don't strand the user on a Hint or
+                # Comment node.
+                if n is not None and n.type not in self.NAVIGABLE:
+                    n = None
+            if n is None and title:
+                n = self._find_child_by_title(cur, title)
+            if n is None:
+                break
             nodes.append(n)
+            cur = n
+        if len(nodes) == 1:
+            return False
         self.stack = nodes
+        # Hint-reveal count only meaningful if we restored a Question leaf.
+        if self.stack[-1].type == "Question":
+            self._resume_revealed = int(entry.get("revealed", 0) or 0)
         return True
 
     def save_state(self) -> None:
         if not (self.state_path and self.state_key):
             return
         blob = self._load_state_blob()
-        # Persist only the path below root; root is always implicit.
-        ids = [n.id for n in self.stack[1:] if n.id != -1]
+        # Persist the path below root with both ids (fast) and titles
+        # (recompose-proof fallback). Root is always implicit.
+        ids = [n.id for n in self.stack[1:]]
+        titles = [n.content or "" for n in self.stack[1:]]
         if ids:
-            blob[self.state_key] = {"stack": ids}
+            data: dict = {"stack": ids, "titles": titles}
+            if (self.stack[-1].type == "Question"
+                    and self._last_hint_revealed > 0):
+                data["revealed"] = self._last_hint_revealed
+            blob[self.state_key] = data
         else:
             blob.pop(self.state_key, None)
         try:
@@ -3195,8 +3336,14 @@ class UHSInteractive:
                 "  b=back  c=chapters  q=quit > ", C.HINT))
             return self._handle_nav_only(ans)
 
-        revealed = 0
         total = len(hints)
+        # Replay any hints the user had already uncovered before quitting,
+        # so they pick up exactly where they left off.
+        revealed = min(self._resume_revealed, total)
+        self._resume_revealed = 0
+        for i in range(revealed):
+            self._print_hint(i + 1, hints[i],
+                             note=" (resumed)" if i == revealed - 1 else "")
         while revealed < total:
             remaining = total - revealed
             prompt = self.paint(
@@ -3205,6 +3352,7 @@ class UHSInteractive:
                 f"b=back  c=chapters  q=quit > ", C.HINT)
             ans = self._ask(prompt)
             if ans is None or ans in ("q", "quit", "exit"):
+                self._last_hint_revealed = revealed
                 return False
             if ans in ("c", "chapters", "home", "/"):
                 self.stack = [self.root]
@@ -3250,16 +3398,23 @@ class UHSInteractive:
               f"{self.paint(note, C.META) if note else ''}")
 
     def _handle_nav_only(self, ans: Optional[str]) -> bool:
-        if ans is None or ans in ("q", "quit", "exit"):
-            return False
-        if ans in ("c", "chapters", "home", "/"):
-            self.stack = [self.root]
-        elif ans in ("b", "back", "u", "up", "..", ""):
-            if len(self.stack) > 1:
-                self.stack.pop()
-        else:
+        # Loop on unknown commands so the caller (e.g. end-of-hints) doesn't
+        # bounce back to the main loop and restart the hint sequence from
+        # zero — that was the visible bug when an unrecognised key like a
+        # stray digit was pressed at the post-hint prompt.
+        while True:
+            if ans is None or ans in ("q", "quit", "exit"):
+                return False
+            if ans in ("c", "chapters", "home", "/"):
+                self.stack = [self.root]
+                return True
+            if ans in ("b", "back", "u", "up", "..", ""):
+                if len(self.stack) > 1:
+                    self.stack.pop()
+                return True
             print(self.paint(f"  unknown command: {ans}", C.WARN))
-        return True
+            ans = self._ask(self.paint(
+                "  b=back  c=chapters  q=quit > ", C.HINT))
 
     # --- main loop ---
 
