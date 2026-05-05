@@ -1091,16 +1091,17 @@ def _count_lines(node: UHSNode) -> int:
         # 1 (header) + 1 (title) + sum(child sizes)
         return 2 + sum(_count_lines(c) for c in node.children)
     if t == "Question":
-        # header + title + sum(hint-line counts) — each Hint child contributes
-        # its own line(s) plus a separator '-' between consecutive hints.
+        # header + title + (hint segments) + (= separator + nested child)*
         hints = [c for c in node.children if c.type == "Hint"]
-        if not hints:
-            return 2
+        nested = [c for c in node.children if c.type != "Hint"]
         lines = 0
         for i, h in enumerate(hints):
             if i > 0:
                 lines += 1   # '-' separator
             lines += max(1, h.content.count("\n") + 1)
+        for c in nested:
+            lines += 1                       # '=' separator
+            lines += _count_lines(c)
         return 2 + lines
     if t == "Comment":
         # header + title + 1 line per content (joined by ' ' on parse)
@@ -1166,30 +1167,38 @@ def _emit(node: UHSNode, key: List[int], out: List[str]):
             _emit(c, key, out)
 
     elif t == "Question":
-        # Java's parseHintNode reads "<count> hint", title, then hint segments
-        # separated by '-' lines.
-        out.append(f"{n_lines} hint")
-        out.append(_sanitise(node.content))
+        # Two flavors: 'hint' (plain — only Hint children) and 'nesthint'
+        # (mixed — Hint + nested non-Hint children, joined by '=' lines).
+        # The cipher used for hint segments differs:
+        #   plain hint  → _enc_string  (parser: decrypt_string)
+        #   nesthint    → _enc_nest_string (parser: decrypt_nest_string)
         hints = [c for c in node.children if c.type == "Hint"]
+        nested = [c for c in node.children if c.type != "Hint"]
+        is_nesthint = bool(nested)
+        cipher = _enc_nest_string if is_nesthint else _enc_string
+
+        def encode_line(s: str) -> str:
+            return cipher(s, key) if is_nesthint else cipher(s)
+
+        out.append(f"{n_lines} {'nesthint' if is_nesthint else 'hint'}")
+        out.append(_sanitise(node.content))
+        # Emit hint segments first.
         for i, h in enumerate(hints):
             if i > 0:
                 out.append("-")
-            # Hint content may contain literal \n (multi-line hint). The
-            # parser joins our emitted file lines with the literal '^break^'
-            # marker and runs parse_text_escapes; default break_str is ' ',
-            # so without a directive multi-line collapses to spaces. Embed a
-            # leading '#w-' on the first encoded segment to flip the
-            # break_str to '\n' for THIS hint (the directive is local to the
-            # parse_text_escapes call on the joined string of one Hint).
             ln_parts = h.content.split("\n")
             is_multiline = len(ln_parts) > 1
             for j, ln in enumerate(ln_parts):
                 if ln == "":
                     out.append(" ")    # bare-space → '\n \n' on parse
                 elif j == 0 and is_multiline:
-                    out.append(_enc_string("#w-" + ln))
+                    out.append(encode_line("#w-" + ln))
                 else:
-                    out.append(_enc_string(ln))
+                    out.append(encode_line(ln))
+        # Then nested non-Hint children, each preceded by '='.
+        for c in nested:
+            out.append("=")
+            _emit(c, key, out)
 
     elif t == "Comment":
         out.append(f"{n_lines} comment")
