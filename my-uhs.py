@@ -3041,12 +3041,81 @@ class UHSInteractive:
             return self.id_map[node.link_target]
         return node
 
-    def _ask(self, prompt: str) -> Optional[str]:
+    def _ask(self, prompt: str, max_choice: int = 0) -> Optional[str]:
+        # On a tty, react instantly to single-key commands (no Enter needed).
+        # Letters/punct return on the first keypress. Digits behave by
+        # context: if max_choice >= 10 a multi-digit number is possible, so
+        # digits accumulate until Enter or a non-digit; otherwise a single
+        # digit returns immediately like a letter. Non-tty stdin (pipes,
+        # tests) falls back to plain line-mode input() to keep regression
+        # scripts working.
+        if not sys.stdin.isatty():
+            try:
+                return input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
         try:
-            return input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
+            import termios, tty
+        except ImportError:
+            try:
+                return input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        buf = ""
+        try:
+            tty.setcbreak(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if not ch:                          # EOF
+                    print()
+                    return None
+                code = ord(ch)
+                if code in (3, 4):                  # Ctrl-C / Ctrl-D
+                    print()
+                    return None
+                if ch == "\x1b":                    # Esc
+                    print()
+                    return None
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n"); sys.stdout.flush()
+                    return buf.strip().lower()
+                if ch in ("\x7f", "\b"):            # Backspace
+                    if buf:
+                        buf = buf[:-1]
+                        sys.stdout.write("\b \b"); sys.stdout.flush()
+                    continue
+                if ch.isdigit():
+                    buf += ch
+                    sys.stdout.write(ch); sys.stdout.flush()
+                    # If only single-digit picks are possible, return now.
+                    if max_choice < 10:
+                        sys.stdout.write("\n"); sys.stdout.flush()
+                        return buf.strip().lower()
+                    # Multi-digit possible: also auto-commit once buf can no
+                    # longer grow into a valid in-range number (e.g. typing
+                    # "3" when max_choice=25 still needs Enter, but "26"
+                    # commits since "26x" can never be ≤25).
+                    try:
+                        if int(buf) * 10 > max_choice:
+                            sys.stdout.write("\n"); sys.stdout.flush()
+                            return buf.strip().lower()
+                    except ValueError:
+                        pass
+                    continue
+                if buf:                             # non-digit ends a number
+                    sys.stdout.write("\n"); sys.stdout.flush()
+                    return buf.strip().lower()
+                # Single-char hot-key: echo and return immediately.
+                sys.stdout.write(ch + "\n"); sys.stdout.flush()
+                return ch.strip().lower()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     # --- menu (Root / Subject / Question with nav children) ---
 
@@ -3079,7 +3148,7 @@ class UHSInteractive:
         ans = self._ask(self.paint(
             f"  [number]=open  e=edit{prompt_extra}  "
             f"b=back  c=chapters  q=quit > ",
-            C.HINT))
+            C.HINT), max_choice=len(kids))
         if ans is None or ans in ("q", "quit", "exit"):
             return False
         if ans in ("c", "chapters", "home", "/"):
