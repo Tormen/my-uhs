@@ -1296,7 +1296,11 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
     lines = text.splitlines()
     title = "Untitled"
     root = UHSNode(type="Root", content="")
+    # `current_chapter` is the most-recent top-level Subject (the `## ` one).
+    # `current_subject` may equal `current_chapter` OR a nested Subject
+    # opened by `### Sub: ...`; new Questions attach to current_subject.
     current_chapter: Optional[UHSNode] = None
+    current_subject: Optional[UHSNode] = None
     current_question: Optional[UHSNode] = None
     # Last opened blockquote-style data node (Comment/Credit/Info/Incentive)
     # — receives subsequent unprefixed `> ` continuation lines.
@@ -1337,58 +1341,79 @@ def parse_notes_markdown(text: str) -> Tuple[str, UHSNode]:
             if marker_id != -1:
                 current_chapter.id = marker_id
             root.children.append(current_chapter)
+            current_subject = current_chapter
             current_question = None
             current_blockquote_data = None
             continue
         if ln.startswith("### "):
-            if current_chapter is None:
-                # No chapter yet — synthesise one.
+            body_text = ln[4:].strip()
+            # `### Sub: Title` opens a nested Subject under the current
+            # top-level chapter. Subsequent Questions attach to it.
+            if body_text.lower().startswith("sub:"):
+                title_text, marker_id = _strip_id_marker(
+                    body_text[4:].strip())
+                if current_chapter is None:
+                    current_chapter = UHSNode(
+                        type="Subject", content="Hints")
+                    root.children.append(current_chapter)
+                nested = UHSNode(type="Subject", content=title_text)
+                if marker_id != -1:
+                    nested.id = marker_id
+                current_chapter.children.append(nested)
+                current_subject = nested
+                current_question = None
+                current_blockquote_data = None
+                continue
+            # Plain `### Title` is a Question.
+            if current_subject is None:
+                # No subject yet — synthesise a chapter.
                 current_chapter = UHSNode(type="Subject", content="Hints")
                 root.children.append(current_chapter)
-            title_text, marker_id = _strip_id_marker(ln[4:].strip())
+                current_subject = current_chapter
+            title_text, marker_id = _strip_id_marker(body_text)
             current_question = UHSNode(type="Question", content=title_text)
             if marker_id != -1:
                 current_question.id = marker_id
-            current_chapter.children.append(current_question)
+            current_subject.children.append(current_question)
             current_blockquote_data = None
             continue
 
         # [Link: title -> #N] reference, sibling of Questions inside a
         # Subject. Matches a whole standalone line (no leading bullet etc).
         m_link = _LINK_REF_RE.match(ln.strip())
-        if m_link and current_chapter is not None:
+        if m_link and current_subject is not None:
             link = UHSNode(type="Link", content=m_link.group(1))
             link.link_target = int(m_link.group(2))
-            current_chapter.children.append(link)
+            current_subject.children.append(link)
             current_question = None
             current_blockquote_data = None
             continue
 
         m_note = _NOTE_RE.match(ln)
-        if m_note and current_chapter is not None:
+        if m_note and current_subject is not None:
             current_blockquote_data = attach_blockquote(
-                current_chapter, "Comment", "CommentData", m_note.group(1))
+                current_subject, "Comment", "CommentData", m_note.group(1))
             current_question = None
             continue
 
         m_credit = _CREDIT_RE.match(ln)
-        if m_credit and current_chapter is not None:
+        if m_credit and current_subject is not None:
             current_blockquote_data = attach_blockquote(
-                current_chapter, "Credit", "CreditData", m_credit.group(1))
+                current_subject, "Credit", "CreditData", m_credit.group(1))
             current_question = None
             continue
 
         m_info = _INFO_RE.match(ln)
-        if m_info and current_chapter is not None:
+        if m_info and current_subject is not None:
             current_blockquote_data = attach_blockquote(
-                current_chapter, "Info", "InfoData", m_info.group(1))
+                current_subject, "Info", "InfoData", m_info.group(1))
             current_question = None
             continue
 
         m_incentive = _INCENTIVE_RE.match(ln)
-        if m_incentive and current_chapter is not None:
+        if m_incentive and current_subject is not None:
             current_blockquote_data = attach_blockquote(
-                current_chapter, "Incentive", "IncentiveData",
+                current_subject, "Incentive", "IncentiveData",
                 m_incentive.group(1))
             current_question = None
             continue
@@ -1552,14 +1577,20 @@ def serialize_uhs_to_notes_md(root: UHSNode) -> str:
         return f" {{#{n.id}}}" if n.id != -1 else ""
 
     def emit_subject(s: UHSNode, depth: int) -> None:
-        # depth 1 == top-level chapter ("## "). Deeper Subjects are flagged
-        # as a known limitation today (plan #2).
-        prefix = "#" * (depth + 1) + " "
-        if depth > 1:
-            out.append(f"<!-- TODO(plan-2): nested Subject at depth {depth} -->")
-        out.append(
-            f"{prefix}{_md_escape_inline(s.content or '(untitled)')}"
-            f"{_id_marker(s)}")
+        # depth 1 == top-level chapter ("## "). Depth 2 emits as
+        # `### Sub: ...`. Deeper levels are flattened with a marker
+        # comment — round-trip will collapse them to depth 2.
+        title = _md_escape_inline(s.content or '(untitled)')
+        marker = _id_marker(s)
+        if depth == 1:
+            out.append(f"## {title}{marker}")
+        elif depth == 2:
+            out.append(f"### Sub: {title}{marker}")
+        else:
+            out.append(
+                f"<!-- TODO(plan-2): nested Subject at depth {depth} "
+                f"flattened to depth 2 on round-trip -->")
+            out.append(f"### Sub: {title}{marker}")
         out.append("")
         for c in s.children:
             emit_child(c, depth)
