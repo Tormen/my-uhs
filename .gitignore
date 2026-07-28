@@ -11,7 +11,7 @@ testing/.regression.conf
 testing/.test.log
 
 # Local tool scratch directories
-.claude/
+.claude
 .claude/**
 
 # Editor / OS noise
