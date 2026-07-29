@@ -12,7 +12,6 @@ testing/.test.log
 
 # Local tool scratch directories
 .claude
-.claude/**
 
 # Editor / OS noise
 .DS_Store
