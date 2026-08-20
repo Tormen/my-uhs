@@ -11,7 +11,6 @@ testing/.regression.conf
 testing/.test.log
 
 # Local tool scratch directories
-.claude
 
 # Editor / OS noise
 .DS_Store
@@ -38,3 +37,8 @@ __pycache__/
 # Local config / catalog if cloned next to the script for testing
 my-uhs.conf
 .my-uhs.conf
+
+# Local-only files: never published, carried between machines by
+# the container repo (see its .git.force-add-patterns).
+*.local
+*.local.*
