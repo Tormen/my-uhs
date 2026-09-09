@@ -211,8 +211,12 @@ CONFIG_FILENAME = "my-uhs.conf"
 
 # Search order (first hit wins) — also the write-back order for --create-config:
 # the highest-priority writable location is used.
+# Under /LINKS/default both spellings are accepted -- the site's config
+# farm holds some names with a .conf suffix and some without; a tool that
+# knows only one of them ignores a config sitting right there.
 CONFIG_SEARCH_PATHS = [
     f"/LINKS/default/{CONFIG_FILENAME}",
+    f"/LINKS/default/{CONFIG_FILENAME.removesuffix('.conf')}",
     str(Path.home() / f".{CONFIG_FILENAME}"),
     f"/etc/{CONFIG_FILENAME}",
     f"/usr/local/etc/{CONFIG_FILENAME}",

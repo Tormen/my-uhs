@@ -1,0 +1,18 @@
+# my-git shadow marker for py/my-uhs -- written by "shadow".
+# SHADOW = content-mirror: this nested repo keeps its LIVE .git (so the
+# IDE works) AND the parent repo also tracks its files. Its OWN .git is
+# the authoritative history; this file is an ordinary, parent-tracked
+# record so "st" can tag it [shadowed] and you know what to undo.
+# Undo with:  my-git unshadow py/my-uhs
+
+shadowed-into-repo: /syst/global/src
+#   ^ the repo whose index MIRRORS these files. This repo keeps its
+#     own live .git, which stays the authoritative history.
+
+first-shadowed: 2026-07-27T09:52:05Z
+last-shadowed: 2026-09-09T21:58:20Z
+
+branch: main
+commit: 2e68d5bfda827ea25e9806e07f988a9754447748
+commit-subject: version: bump v2.3 → v2.4 (updated documentation)
+remote.origin.url: git@github.com:Tormen/my-uhs.git
