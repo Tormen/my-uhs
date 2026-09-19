@@ -10,9 +10,9 @@ shadowed-into-repo: /syst/global/src
 #     own live .git, which stays the authoritative history.
 
 first-shadowed: 2026-07-27T09:52:05Z
-last-shadowed: 2026-09-09T21:58:20Z
+last-shadowed: 2026-09-19T11:45:08Z
 
 branch: main
-commit: 2e68d5bfda827ea25e9806e07f988a9754447748
-commit-subject: version: bump v2.3 → v2.4 (updated documentation)
+commit: 
+commit-subject:
 remote.origin.url: git@github.com:Tormen/my-uhs.git
