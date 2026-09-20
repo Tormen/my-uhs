@@ -33,8 +33,8 @@ import sys
 # so a deployed copy with no .git answers too.
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION = "v2.4"
-SCRIPT_COMMIT  = "6a95417"
-SCRIPT_RELEASE = "v2.4-7-g6a95417"
+SCRIPT_COMMIT  = "117322e"
+SCRIPT_RELEASE = "v2.4-8-g117322e"
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -62,7 +62,20 @@ def _script_describe() -> str:
                             "describe", "--tags", "--long"],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            desc = r.stdout.strip()
+            # describe answers about WHERE this file sits, not about what it
+            # is: a copy dropped in a foreign repo gets THAT repo's tags
+            # (/LINKS/global is one, and it holds the copies update-LINKS
+            # promotes).  The stamped commit is the proof -- a repo that does
+            # not have it is not this tool's repo.
+            if SCRIPT_COMMIT:
+                own = subprocess.run(
+                    ["git", "-c", "safe.directory=*", "-C", os.path.dirname(os.path.realpath(__file__)),
+                     "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
+                    capture_output=True, text=True, timeout=5)
+                if own.returncode != 0:
+                    return SCRIPT_RELEASE
+            return desc
     except Exception:
         pass
     return SCRIPT_RELEASE
