@@ -33,8 +33,8 @@ import sys
 # so a deployed copy with no .git answers too.
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION = "v2.4"
-SCRIPT_COMMIT  = "117322e"
-SCRIPT_RELEASE = "v2.4-8-g117322e"
+SCRIPT_COMMIT  = "dd6127e"
+SCRIPT_RELEASE = "v2.4-9-gdd6127e"
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -74,11 +74,14 @@ def _script_describe() -> str:
                      "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
                     capture_output=True, text=True, timeout=5)
                 if own.returncode != 0:
-                    return SCRIPT_RELEASE
+                    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
             return desc
     except Exception:
         pass
-    return SCRIPT_RELEASE
+    # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is
+    # no stamp to fall back to, and a lone SCRIPT_RELEASE would be a release
+    # claim nothing backs -- an unstamped file says so.
+    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
 
 
 def _script_version_string() -> str:
