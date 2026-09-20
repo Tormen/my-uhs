@@ -26,36 +26,68 @@ import sys
 
 # ---------------------------------------------------------------------------
 # Version / license constants (same pattern as my-plex).
-# SCRIPT_VERSION tracks the latest git tag; bump in lockstep with `git tag`.
-# SCRIPT_COMMIT is baked in via `--stamp-version` so deployed copies (no
-# .git alongside) still print the commit they were built from.
+# SCRIPT_VERSION names the release these bytes are BASED on; only a release
+# commit sets it.  SCRIPT_COMMIT is the commit this file was released from
+# and SCRIPT_RELEASE what `git describe --tags --long` said then (<nearest
+# tag>-<commits since it>-g<short sha>), both baked in via `--stamp-version`
+# so a deployed copy with no .git answers too.
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION = "v2.4"
-SCRIPT_COMMIT  = ""
+SCRIPT_COMMIT  = "6a95417"
+SCRIPT_RELEASE = "v2.4-7-g6a95417"
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
 
 
+def _script_build_id() -> str:
+    """First 12 hex of this file's own SHA-256: the value that identifies the
+    bytes, so two installs are compared by running --version on each."""
+    import hashlib
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def _script_describe() -> str:
+    """git's own `describe --tags --long`, else the stamped value.  Git first:
+    in a checkout it is exact at every moment, while the stamp is written
+    BEFORE the release is tagged and so lags one release step.  A deployed
+    copy has no git and falls back to the stamp."""
+    try:
+        here = os.path.dirname(os.path.realpath(__file__))
+        r = subprocess.run(["git", "-c", "safe.directory=*", "-C", here,
+                            "describe", "--tags", "--long"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return SCRIPT_RELEASE
+
+
 def _script_version_string() -> str:
-    """SCRIPT_VERSION + commit sha (baked or live, with -dirty suffix)."""
-    sha = SCRIPT_COMMIT
-    if not sha:
-        try:
-            here = os.path.dirname(os.path.realpath(__file__))
-            r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
-                               capture_output=True, text=True, timeout=2)
-            if r.returncode == 0 and r.stdout.strip():
-                sha = r.stdout.strip()
-                d  = subprocess.run(["git", "-C", here, "diff", "--quiet"],
-                                    capture_output=True, timeout=2)
-                ds = subprocess.run(["git", "-C", here, "diff", "--cached", "--quiet"],
-                                    capture_output=True, timeout=2)
-                if d.returncode != 0 or ds.returncode != 0:
-                    sha += "-dirty"
-        except Exception:
-            pass
-    return f"{SCRIPT_VERSION} ({sha})" if sha else SCRIPT_VERSION
+    """What these bytes are: the release they are based on, whether they ARE
+    it, and the id of the bytes themselves.
+
+        v2.4 (v2.4-0-g7dcf1b3: the v2.4 tag, build 1a2b3c4d5e6f)
+        v2.4+6 (v2.4-6-g7dcf1b3: 6 commit(s) past v2.4, unreleased, build ..)
+    """
+    build = _script_build_id()
+    desc = _script_describe()
+    head, _sep, sha = desc.rpartition("-g")
+    tag, _sep2, count = head.rpartition("-")
+    if sha and tag and count.isdigit():
+        n = int(count)
+        if n == 0:
+            return f"{SCRIPT_VERSION} ({desc}: the {tag} tag, build {build})"
+        return (f"{SCRIPT_VERSION}+{n} ({desc}: {n} commit(s) past {tag}, "
+                f"unreleased, build {build})")
+    if SCRIPT_COMMIT:
+        return f"{SCRIPT_VERSION} (commit {SCRIPT_COMMIT}, build {build})"
+    return f"{SCRIPT_VERSION} (build {build}, unstamped)"
 
 
 def _print_version_and_exit() -> None:
@@ -92,9 +124,15 @@ def _stamp_version_and_exit() -> None:
     with open(self_path) as f:
         src = f.read()
     import re as _re
+    # git's own spelling, kept verbatim so it can be pasted back into git
+    new_desc = subprocess.run(["git", "-C", here, "describe", "--tags", "--long"],
+                              capture_output=True, text=True).stdout.strip()
     new_src, n = _re.subn(r'^SCRIPT_COMMIT\s*=\s*"[^"]*"',
                           f'SCRIPT_COMMIT  = "{new_sha}"',
                           src, count=1, flags=_re.MULTILINE)
+    new_src, _nr = _re.subn(r'^SCRIPT_RELEASE\s*=\s*"[^"]*"',
+                            f'SCRIPT_RELEASE = "{new_desc}"',
+                            new_src, count=1, flags=_re.MULTILINE)
     if n == 0:
         print("ERROR: Could not find SCRIPT_COMMIT line to stamp.", file=sys.stderr)
         sys.exit(1)
