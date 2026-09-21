@@ -33,8 +33,8 @@ import sys
 # so a deployed copy with no .git answers too.
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION = "v2.4"
-SCRIPT_COMMIT  = "dd6127e"
-SCRIPT_RELEASE = "v2.4-9-gdd6127e"
+SCRIPT_COMMIT  = "bba1dc1"
+SCRIPT_RELEASE = "v2.4-10-gbba1dc1"
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -134,6 +134,15 @@ def _stamp_version_and_exit() -> None:
                        capture_output=True, text=True)
     if r.returncode != 0:
         print(f"ERROR: Not in a git repo (script dir: {here})", file=sys.stderr)
+        sys.exit(1)
+    # The repo may be SHARED -- other sessions commit here too -- and an amend
+    # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+    # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+    touched = subprocess.run(["git", "-C", here, "show", "--name-only", "--format=", "HEAD",
+                              "--", os.path.basename(self_path)],
+                             capture_output=True, text=True).stdout.strip()
+    if not touched:
+        print("ERROR: --stamp-version: HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's).", file=sys.stderr)
         sys.exit(1)
     new_sha = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True).stdout.strip()
