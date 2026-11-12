@@ -254,6 +254,7 @@ import argparse
 import configparser
 import json
 import logging
+import pwd
 import re
 import time
 import urllib.request
@@ -267,29 +268,122 @@ from typing import Dict, List, Optional, Tuple
 __version__ = SCRIPT_VERSION.lstrip("v")
 
 # ---------------------------------------------------------------------------
-# Config — search paths, defaults, load, write-default
+# Config — the site file, search paths, defaults, load, write-default
 # ---------------------------------------------------------------------------
 
+# The site file: the one site path this tool knows.  It names, for every tool
+# of a site, the base directories, the directory a config is searched in and
+# the one a missing config is offered in.  Without it, the neutral values of
+# Site below, so a clone elsewhere works with no setup.
+SITE_CONF = "/LINKS/default/site.conf"
+
+
+@dataclass(frozen=True)
+class Site:
+    """The site's values, each with its neutral fallback."""
+    data_base_dir: str = "/var/db"
+    log_base_dir: str = "/var/log"
+    config_search_dir: str = ""     # searched for my-uhs.conf, then my-uhs
+    config_offer_dir: str = ""      # "no config found" offers my-uhs.conf here
+    config_offer_note: str = ""     # said beside that offer
+
+
+class SiteConfError(Exception):
+    """SITE_CONF is there but cannot be used."""
+
+
+_SITE_KEYS: Dict[str, str] = {
+    "DATA_BASE_DIR": "data_base_dir", "LOG_BASE_DIR": "log_base_dir",
+    "CONFIG_SEARCH_DIR": "config_search_dir",
+    "CONFIG_OFFER_DIR": "config_offer_dir",
+    "CONFIG_OFFER_NOTE": "config_offer_note"}
+# What a shell reads as the same plain value: no expansion, no escape.
+_SITE_LINE = re.compile(r'([A-Z_][A-Z0-9_]*)="([^"$`\\]*)"')
+
+
+def read_site() -> Site:
+    """SITE_CONF parsed, never run: plain KEY="value" lines, the same a shell
+    tool sources.  Absent: the neutral values.  There but unreadable, or a
+    line a shell would read otherwise: SiteConfError, never the neutral
+    values, which would put this run's log apart from everyone else's.  Taken
+    from the file only -- an exported variable never takes its place."""
+    if not os.path.lexists(SITE_CONF):
+        return Site()
+    try:
+        with open(SITE_CONF, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise SiteConfError(
+            f"cannot read {SITE_CONF} ({e.strerror}) -- the site's "
+            f"directories for every tool") from e
+    values: Dict[str, str] = {}
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _SITE_LINE.fullmatch(line)
+        if not m:
+            raise SiteConfError(
+                f"{SITE_CONF} line {n} is not a plain KEY=\"value\" line: "
+                f"{line}")
+        if m.group(1) in _SITE_KEYS:
+            values[_SITE_KEYS[m.group(1)]] = m.group(2)
+    return Site(**values)
+
+
 CONFIG_FILENAME = "my-uhs.conf"
+# In the site's search directory both spellings are read, .conf first: a
+# config farm may hold either, and a tool that knows only one ignores a
+# config sitting right there.  Everywhere else the name keeps its .conf.
+SITE_CONFIG_NAMES = (CONFIG_FILENAME, CONFIG_FILENAME.removesuffix(".conf"))
+SYSTEM_CONFIG_PATHS = (f"/etc/{CONFIG_FILENAME}",
+                       f"/usr/local/etc/{CONFIG_FILENAME}")
 
-# Search order (first hit wins) — also the write-back order for --create-config:
-# the highest-priority writable location is used.
-# Under /LINKS/default both spellings are accepted -- the site's config
-# farm holds some names with a .conf suffix and some without; a tool that
-# knows only one of them ignores a config sitting right there.
-CONFIG_SEARCH_PATHS = [
-    f"/LINKS/default/{CONFIG_FILENAME}",
-    f"/LINKS/default/{CONFIG_FILENAME.removesuffix('.conf')}",
-    str(Path.home() / f".{CONFIG_FILENAME}"),
-    f"/etc/{CONFIG_FILENAME}",
-    f"/usr/local/etc/{CONFIG_FILENAME}",
-]
 
+def config_search_paths(site: Site) -> List[str]:
+    """Where a config is looked for, first hit wins: the site's search
+    directory (when the site names one), ~/.my-uhs.conf, /etc, /usr/local/etc."""
+    farm = ([os.path.join(site.config_search_dir, n) for n in SITE_CONFIG_NAMES]
+            if site.config_search_dir else [])
+    return (farm + [str(Path.home() / f".{CONFIG_FILENAME}")]
+            + list(SYSTEM_CONFIG_PATHS))
+
+
+def config_offer_paths(site: Site) -> List[str]:
+    """Where "no config found" offers one, most common place first: the
+    site's offer directory -- only while the site's search directory is
+    searched, which a file there reaches as the site's note says; never the
+    search directory itself -- then /etc, then yours.  Every other offer is
+    checked against the search, so the two cannot drift."""
+    searched = set(config_search_paths(site))
+    offer = ([os.path.join(site.config_offer_dir, CONFIG_FILENAME)]
+             if site.config_offer_dir and site.config_search_dir
+             and site.config_offer_dir != site.config_search_dir else [])
+    return offer + [p for p in (SYSTEM_CONFIG_PATHS[0],
+                                str(Path.home() / f".{CONFIG_FILENAME}"))
+                    if p in searched]
+
+
+def no_config_offer(site: Site) -> str:
+    """The "no config found" lines: each offered place paste-ready, the
+    site's note beside its own place."""
+    lines = ["--> no config found (built-in defaults in use) -- "
+             "to write one, most common place first:"]
+    for p in config_offer_paths(site):
+        note = (f"   ({site.config_offer_note})"
+                if site.config_offer_note
+                and os.path.dirname(p) == site.config_offer_dir else "")
+        lines.append(f"    > my-uhs --create-config > {p}{note}")
+    return "\n".join(lines)
+
+
+# $LOG_BASE_DIR / $DATA_BASE_DIR are the site's, $USER the user my-uhs runs
+# as -- see _expand.
 DEFAULTS: Dict[str, str] = {
-    "catalog_dir":   str(Path.home() / ".my-uhs.catalog"),
+    "catalog_dir":   "~/.my-uhs.catalog",
     "catalog_url":   "http://www.uhs-hints.com/cgi-bin/update.cgi",
     "user_agent":    f"my-uhs/{__version__} (+OpenUHS-compatible)",
-    "logfile":       str(Path.home() / "Library" / "Logs" / "my-uhs.log"),
+    "logfile":       "$LOG_BASE_DIR/$USER/my-uhs.log",
     "color":         "auto",      # auto | always | never
     "fetch_timeout": "30",        # seconds
 }
@@ -297,8 +391,12 @@ DEFAULTS: Dict[str, str] = {
 DEFAULT_CONFIG_TEXT = f"""\
 # my-uhs configuration file
 # Edit values below; lines starting with '#' are comments.
-# Search order: /LINKS/default/  →  ~/.{CONFIG_FILENAME}  →  /etc/  →  /usr/local/etc/
+# Search order: the site's config directory (when {SITE_CONF}
+# names one)  →  ~/.{CONFIG_FILENAME}  →  /etc/  →  /usr/local/etc/
 # First hit wins. Override with --config <PATH>.
+# In values: ~ and $VAR are expanded; $LOG_BASE_DIR and $DATA_BASE_DIR come
+# from {SITE_CONF} (/var/log and /var/db without it), and $USER
+# is the user my-uhs runs as.
 
 [my-uhs]
 
@@ -325,34 +423,51 @@ fetch_timeout = {DEFAULTS['fetch_timeout']}
 """
 
 
-def find_config(explicit: Optional[str]) -> Optional[str]:
+_VAR_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+
+def _expand(value: str, site: Site) -> str:
+    """VALUE with the site's names and $USER resolved first -- from the site
+    file and the user this runs as, never from the environment, so an
+    exported LOG_BASE_DIR or a sudo-kept USER cannot move the log -- then ~
+    and any other $VAR from the environment."""
+    names = {"DATA_BASE_DIR": site.data_base_dir,
+             "LOG_BASE_DIR": site.log_base_dir,
+             "USER": pwd.getpwuid(os.geteuid()).pw_name}
+
+    def sub(mo: re.Match[str]) -> str:
+        return names.get(mo.group(1) or mo.group(2), mo.group(0))
+
+    return os.path.expanduser(os.path.expandvars(_VAR_REF.sub(sub, value)))
+
+
+def find_config(explicit: Optional[str], site: Site) -> Optional[str]:
     if explicit:
         return explicit if Path(explicit).is_file() else None
-    for p in CONFIG_SEARCH_PATHS:
+    for p in config_search_paths(site):
         if Path(p).is_file():
             return p
     return None
 
 
-def load_config(explicit: Optional[str]
+def load_config(explicit: Optional[str], site: Site
                 ) -> Tuple[Dict[str, str], Optional[str]]:
     cfg = dict(DEFAULTS)
-    used = find_config(explicit)
+    used = find_config(explicit, site)
     if used:
         parser = configparser.ConfigParser()
         try:
             parser.read(used, encoding="utf-8")
+            section = "my-uhs" if parser.has_section("my-uhs") else None
+            items = (parser.items(section) if section
+                     else list(parser.defaults().items()))
         except (OSError, configparser.Error) as e:
             print(f"my-uhs: warning: cannot read config {used}: {e}",
                   file=sys.stderr)
-            return cfg, None
-        section = "my-uhs" if parser.has_section("my-uhs") else None
-        items = parser.items(section) if section else parser.defaults().items()
+            items, used = [], None
         for k, v in items:
-            cfg[k.lower()] = os.path.expanduser(os.path.expandvars(v))
-    for k in ("catalog_dir", "logfile"):
-        cfg[k] = os.path.expanduser(os.path.expandvars(cfg[k]))
-    return cfg, used
+            cfg[k.lower()] = v
+    return {k: _expand(v, site) for k, v in cfg.items()}, used
 
 
 def create_config(target_path: str) -> str:
@@ -3919,9 +4034,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     show_config = args.config == "__SHOW__"
     config_path = None if show_config else args.config
 
-    cfg, used = load_config(config_path)
+    try:
+        site = read_site()
+    except SiteConfError as e:
+        print(f"my-uhs: ERROR: {e}", file=sys.stderr)
+        return 2
+    cfg, used = load_config(config_path, site)
     if show_config:
         sys.stdout.write(render_effective_config(cfg, used))
+        if not used and not config_path:
+            print(no_config_offer(site), file=sys.stderr)
         return 0
 
     # --complete TOPIC: machine-readable lines for the zsh completion.

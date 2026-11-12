@@ -81,15 +81,33 @@ Format: standard INI with a single `[my-uhs]` section.
 
 **Search order (first hit wins):**
 
-1. `/LINKS/default/my-uhs.conf`
+1. the site's config directory, when `/LINKS/default/site.conf` names one
+   (`CONFIG_SEARCH_DIR`): `my-uhs.conf`, then the bare `my-uhs`
 2. `~/.my-uhs.conf`
 3. `/etc/my-uhs.conf`
 4. `/usr/local/etc/my-uhs.conf`
 
-`--config PATH` overrides the search entirely. `--create-config` (no
-argument) prints the fully-commented default config to stdout; pass an
-explicit target path (`--create-config ~/.my-uhs.conf`) to write it to a
-file. The file form refuses to overwrite an existing file.
+`--config PATH` overrides the search entirely. `--config` (no argument)
+prints the effective config; when no file was found it also prints, on
+stderr, where to write one. `--create-config` (no argument) prints the
+fully-commented default config to stdout; pass an explicit target path
+(`--create-config ~/.my-uhs.conf`) to write it to a file. The file form
+refuses to overwrite an existing file.
+
+### The site file
+
+`/LINKS/default/site.conf` is the one site-specific path my-uhs knows. It
+holds plain `KEY="value"` lines, which my-uhs parses (never runs):
+
+| Key | Used as | Without the file |
+| --- | --- | --- |
+| `LOG_BASE_DIR` | `$LOG_BASE_DIR` in values (the default `logfile`) | `/var/log` |
+| `DATA_BASE_DIR` | `$DATA_BASE_DIR` in values | `/var/db` |
+| `CONFIG_SEARCH_DIR` | searched first (above) | not searched |
+| `CONFIG_OFFER_DIR`, `CONFIG_OFFER_NOTE` | offered first when no config is found | not offered |
+
+A site file that is there but unreadable, or holds a line that is not a
+plain `KEY="value"`, is an error: my-uhs stops instead of falling back.
 
 ### Keys
 
@@ -98,11 +116,13 @@ file. The file form refuses to overwrite an existing file.
 | `catalog_dir` | `~/.my-uhs.catalog/` | Holds `index.json`, `remote-catalog.xml`, and `files/<name>.uhs`. |
 | `catalog_url` | `http://www.uhs-hints.com/cgi-bin/update.cgi` | The official OpenUHS update server. |
 | `user_agent` | `my-uhs/<version> (+OpenUHS-compatible)` | Sent on all HTTP requests. |
-| `logfile` | `~/Library/Logs/my-uhs.log` | Only written when `-D` is given. |
+| `logfile` | `$LOG_BASE_DIR/$USER/my-uhs.log` | Only written when `-D` is given. |
 | `color` | `auto` | `auto` (TTY-aware), `always`, or `never`. |
 | `fetch_timeout` | `30` | Network timeout in seconds for `pull` and `catalog`. |
 
-`~` and `$VAR` references are expanded.
+`~` and `$VAR` references are expanded. `$LOG_BASE_DIR` and
+`$DATA_BASE_DIR` come from the site file, and `$USER` is the user my-uhs
+runs as -- never from the environment; any other `$VAR` does.
 
 ### Example
 
