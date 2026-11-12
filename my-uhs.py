@@ -33,8 +33,8 @@ import sys
 # so a deployed copy with no .git answers too.
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION = "v2.4"
-SCRIPT_COMMIT  = "bba1dc1"
-SCRIPT_RELEASE = "v2.4-10-gbba1dc1"
+SCRIPT_COMMIT  = "cbb6db4"
+SCRIPT_RELEASE = "v2.4-13-gcbb6db4"
 SCRIPT_COPYRIGHT = "Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT = "GPL-2.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL   = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -65,8 +65,8 @@ def _script_describe() -> str:
             desc = r.stdout.strip()
             # describe answers about WHERE this file sits, not about what it
             # is: a copy dropped in a foreign repo gets THAT repo's tags
-            # (/LINKS/global is one, and it holds the copies my-rollout
-            # promotes).  The stamped commit is the proof -- a repo that does
+            # (a deployment tree kept in git, which holds the deployed
+            # copies, is one).  The stamped commit is the proof -- a repo that does
             # not have it is not this tool's repo.
             if SCRIPT_COMMIT:
                 own = subprocess.run(
